@@ -119,7 +119,10 @@ export async function request<T = unknown>(path: string, opts: RequestOpts = {})
       const scoped = engine ? (() => { try { return sessionStorage.getItem(tokenKey(engine)) || ""; } catch { return ""; } })() : "";
       const main = readToken();
       const headers: Record<string, string> = { Accept: "application/json" };
-      const token = opts.token !== undefined ? opts.token : readToken(engine);
+      // 主令牌就是 wb 的令牌；qd/trae 只用自己的槽位，绝不拿主令牌硬打。
+      // 三家令牌互不通用，串用必然 401，而 401 又可能触发全站登出。
+      const token = opts.token !== undefined ? opts.token
+        : (engine && engine !== "wb" ? scoped : main);
       if (token) headers["X-Panel-Token"] = token;
       if (opts.body !== undefined) headers["Content-Type"] = "application/json";
 
@@ -130,16 +133,6 @@ export async function request<T = unknown>(path: string, opts: RequestOpts = {})
         body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
         signal: controller.signal,
       });
-
-      // 引擎槽里可能存着「上一轮进程」的旧令牌（服务重启/密钥轮换后失效）。
-      // 命中 401 且用的是引擎槽 → 清掉坏槽、用主令牌重试一次：面板自愈，用户不用手动清缓存。
-      if (res.status === 401 && opts.token === undefined && engine && scoped && main && scoped !== main) {
-        writeToken("", engine);
-        opts.signal?.removeEventListener("abort", onAbort);
-        clearTimeout(timer);
-        inflight.delete(key);
-        return await request<T>(path, { ...opts, token: main, dedupe: false });
-      }
 
       // 第一次 401：让 api 层用内存口令给这家重登一次，拿到新令牌就重试（只试一次）。
       const isLoginPath = /\/panel\/login$/.test(path);
@@ -155,9 +148,11 @@ export async function request<T = unknown>(path: string, opts: RequestOpts = {})
       }
 
       if (res.status === 401) {
-        // 令牌轮换（服务重启/换密钥）后会全站 401：清掉所有槽并广播，
-        // 由登录门接住并重新要密码 —— 比在视图里显示"某家没数据"诚实得多。
-        if (opts.token === undefined && (!engine || token === main || !scoped)) {
+        // 只有主会话（hub 接口 / wb 主槽）失效才全站登出并广播。
+        // qd、trae 没登录或面板密码不同，它们返回 401 是常态；
+        // 以前这里会把整个 sessionStorage 清空，于是总览轮询到那两家就把人踢下线。
+        const mainSession = !engine || engine === "wb";
+        if (opts.token === undefined && mainSession) {
           try {
             for (const k of Object.keys(sessionStorage)) {
               if (k.indexOf(TOKEN_KEY) === 0) sessionStorage.removeItem(k);

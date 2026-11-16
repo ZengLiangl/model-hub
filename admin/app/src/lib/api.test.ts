@@ -36,6 +36,24 @@ describe('http', () => {
     await expect(get("/api/wb/accounts")).rejects.toMatchObject({ status: 401, kind: "unauthorized" });
   });
 
+  it('qd/trae 未登录的 401 不清主会话，只有主槽 401 才登出', async () => {
+    writeToken("main-wb");
+    const onUnauthorized = vi.fn();
+    window.addEventListener("hub-unauthorized", onUnauthorized);
+    mockFetch(() => json({ error: "unauthorized" }, 401));
+
+    // 没有 qd 槽位 → 不能拿主令牌去打，也不能因为 401 把主会话清掉
+    await expect(get("/api/qd/usage")).rejects.toMatchObject({ status: 401 });
+    expect(readToken()).toBe("main-wb");
+    expect(onUnauthorized).not.toHaveBeenCalled();
+
+    // 主槽（wb）失效才是真的会话失效
+    await expect(get("/api/wb/usage")).rejects.toMatchObject({ status: 401 });
+    expect(readToken()).toBe("");
+    expect(onUnauthorized).toHaveBeenCalledTimes(1);
+    window.removeEventListener("hub-unauthorized", onUnauthorized);
+  });
+
   it('写操作按方法+路径+body 在失去重', async () => {
     mockFetch(async () => {
       await new Promise((r) => setTimeout(r, 30));
