@@ -129,6 +129,18 @@ describe('逐引擎令牌槽（每家令牌独立）', () => {
 });
 
 describe('api.login', () => {
+  it('统一登录：只请求门户一次，不再逐家补登', async () => {
+    mockFetch((url) => {
+      if (url.includes("/hub/panel/login")) return json({ ok: true, token: "hub-tk" });
+      return json({ ok: true, token: "x" });
+    });
+    const r = await login("admin", "wb");
+    expect(r.ok).toBe(true);
+    expect(calls.length).toBe(1);
+    expect(calls[0].url).toContain("/hub/panel/login");
+    expect(readToken()).toBe("hub-tk");
+  });
+
   it('第一家成功就直接用', async () => {
     mockFetch((url) => (url.includes("/wb/panel/login") ? json({ ok: true, token: "tk" }) : json({}, 500)));
     const r = await login("admin", "wb");

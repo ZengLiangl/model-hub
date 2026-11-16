@@ -21615,7 +21615,18 @@ class Handler(BaseHTTPRequestHandler):
         token = (self.headers.get("X-Panel-Token") or "").strip()
         return token
     def _panel_ok(self):
-        return PANEL.valid(self._panel_token())
+        if PANEL.valid(self._panel_token()):
+            return True
+        # 门户统一登录：门户已校验面板口令，转发时带内部令牌；
+        # 只认回环来源，直接访问引擎端口仍然走本引擎自己的口令。
+        secret = os.environ.get("HUB_INTERNAL_TOKEN") or ""
+        got = (self.headers.get("X-Hub-Panel") or "").strip()
+        if secret and got and got == secret:
+            try:
+                return ipaddress.ip_address(self.client_address[0]).is_loopback
+            except Exception:
+                return False
+        return False
     @staticmethod
     def _is_panel_route(path):
         """Management endpoints shown in the web panel.

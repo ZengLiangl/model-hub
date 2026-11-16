@@ -121,10 +121,10 @@ export async function request<T = unknown>(path: string, opts: RequestOpts = {})
       const scoped = engine ? (() => { try { return sessionStorage.getItem(tokenKey(engine)) || ""; } catch { return ""; } })() : "";
       const main = readToken();
       const headers: Record<string, string> = { Accept: "application/json" };
-      // 主令牌就是 wb 的令牌；qd/trae 只用自己的槽位，绝不拿主令牌硬打。
-      // 三家令牌互不通用，串用必然 401，而 401 又可能触发全站登出。
+      // 门户统一登录后，主令牌就是门户会话令牌，三家通用（门户校验后带内部
+      // 令牌转发）。直连引擎面板时仍优先用该引擎自己的槽位。
       const token = opts.token !== undefined ? opts.token
-        : (engine && engine !== "wb" ? scoped : main);
+        : (engine ? (scoped || main) : main);
       if (token) headers["X-Panel-Token"] = token;
       if (opts.body !== undefined) headers["Content-Type"] = "application/json";
 

@@ -47,8 +47,25 @@ export type LoginResult =
   | { ok: true; token: string; usingDefaultPassword: boolean; degraded?: Engine }
   | { ok: false; error: string };
 
-/** 登录：默认打「当前引擎」，失败则挨家试 —— 某一家挂了不该让整站登不上。 */
+/** 登录：优先走门户统一登录（一次请求、一套口令），旧后端再退回逐引擎登录。 */
 export async function login(password: string, engine: Engine = "wb"): Promise<LoginResult> {
+  panelPassword = password;
+  try {
+    const r = await post<{ token?: string; using_default_password?: boolean }>(
+      API + "/hub/panel/login",
+      { password },
+      { dedupe: true, timeoutMs: 8000 },
+    );
+    if (r?.token) {
+      writeToken(r.token);
+      writeToken(r.token, "wb");
+      return { ok: true, token: r.token, usingDefaultPassword: !!r.using_default_password };
+    }
+  } catch (err) {
+    // 口令错误直接返回；其它情况（旧后端没有端点、代理异常）退回逐引擎登录
+    if ((err as ApiError)?.status === 401) return { ok: false, error: "unauthorized" };
+  }
+
   const attempt = async (eng: Engine) => {
     const data = await post<{ token?: string; panel_token?: string; ok?: boolean; using_default_password?: boolean }>(
       API + "/" + eng + "/panel/login",
@@ -440,6 +457,19 @@ export const importPat = (eng: Engine, pat: string, realm?: string) =>
 
 /** 改面板密码：成功后**令牌会轮换**，必须把新令牌写回，否则当前会话立刻失效。 */
 export async function changePanelPassword(eng: Engine, current: string, next: string): Promise<void> {
+  // 统一登录后只改门户口令（一处生效，三家共用）；旧后端才退回引擎级修改
+  try {
+    await post<{ ok?: boolean }>(
+      API + "/hub/settings/save",
+      { panel_password: { current: current, new: next } },
+      { dedupe: true, token: current },
+    );
+    panelPassword = next;
+    return;
+  } catch (err) {
+    const status = (err as ApiError)?.status;
+    if (status !== 404 && status !== 405) throw err;
+  }
   const res = await post<{ ok?: boolean; token?: string }>(
     API + "/" + eng + "/panel/password", { current: current, new: next }, { dedupe: true },
   );

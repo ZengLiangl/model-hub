@@ -35,6 +35,7 @@
 import argparse
 import gzip
 import hashlib
+import secrets
 import threading
 import http.client
 import json
@@ -108,6 +109,38 @@ def _note_duplicate(fingerprint):
 
 API_PREFIX = "/api"
 HUB_PREFIX = API_PREFIX + "/hub"
+
+# ---------------------------------------------------------------- 统一登录
+# 门户一套口令（hub/core/settings.py 的 panel password），登录一次拿会话令牌；
+# 引擎侧通过「门户内部令牌 + 回环来源」信任门户的转发，不再各自校验密码。
+# 这样三家面板密码是否一致都不影响通过门户访问，改密码也只改门户这一处。
+HUB_SESSION_TTL = 7 * 24 * 3600
+_HUB_SESSIONS = {}
+_HUB_SESSIONS_LOCK = threading.RLock()
+_HUB_INTERNAL_HEADER = "X-Hub-Panel"
+
+
+def _hub_session_new():
+    token = secrets.token_urlsafe(24)
+    now = time.time()
+    with _HUB_SESSIONS_LOCK:
+        for stale in [k for k, exp in _HUB_SESSIONS.items() if exp < now]:
+            _HUB_SESSIONS.pop(stale, None)
+        _HUB_SESSIONS[token] = now + HUB_SESSION_TTL
+    return token
+
+
+def _hub_session_ok(token):
+    if not token:
+        return False
+    with _HUB_SESSIONS_LOCK:
+        exp = _HUB_SESSIONS.get(token)
+        if not exp:
+            return False
+        if exp < time.time():
+            _HUB_SESSIONS.pop(token, None)
+            return False
+        return True
 
 #: 显式 MIME 表。.js 必须是 text/javascript —— 模块脚本对 MIME 敏感。
 MIME_TYPES = {
@@ -418,7 +451,8 @@ class PortalHandler(BaseHTTPRequestHandler):
                 #   /settings/save 存合并层配置 · /try 就地试打（真的往自己的 /api/v1 发一条）
                 allowed_post = (HUB_PREFIX + "/settings/save", HUB_PREFIX + "/try",
                                 HUB_PREFIX + "/routing",
-                                HUB_PREFIX + "/routing/preview")
+                                HUB_PREFIX + "/routing/preview",
+                                HUB_PREFIX + "/panel/login")
                 # 路由编排是用户可编辑配置：PUT /api/hub/routing 整表保存（乐观锁）。
                 allowed_put = (HUB_PREFIX + "/routing",)
                 if not ((method == "POST" and path in allowed_post)
@@ -451,6 +485,23 @@ class PortalHandler(BaseHTTPRequestHandler):
         ports = self.server.ports
         params = urllib.parse.parse_qs(query or "")
         realm = (params.get("realm") or [None])[0] or None
+
+        # 统一登录：门户只认一套口令，登录一次拿到会话令牌，三家引擎共用
+        if rest == "panel/login":
+            if method != "POST":
+                return self._json(405, {"error": "use POST /api/hub/panel/login"})
+            try:
+                body = json.loads(self._read_body() or b"{}")
+            except Exception:
+                body = {}
+            password = str((body or {}).get("password") or "")
+            if not settings.verify_panel_password(password):
+                return self._json(401, {"error": "unauthorized"})
+            return self._json(200, {
+                "ok": True,
+                "token": _hub_session_new(),
+                "using_default_password": settings.panel_password_default(),
+            })
 
         if rest == "routing/preview":
             import json as _json
@@ -1279,6 +1330,11 @@ class PortalHandler(BaseHTTPRequestHandler):
             if strip_headers and name.lower() in strip_headers:
                 continue
             headers[name] = value
+        # 门户会话有效 → 带内部令牌转发；引擎只信任回环来源上的这个头，
+        # 于是三家面板密码不必一致，改密码也只需改门户这一处。
+        _inner = os.environ.get("HUB_INTERNAL_TOKEN") or ""
+        if _inner and _hub_session_ok((self.headers.get("X-Panel-Token") or "").strip()):
+            headers[_HUB_INTERNAL_HEADER] = _inner
         if upstream_key:
             # 合并模式：用**该引擎自己的一把 key** 换掉客户端那把（客户端用的是
             # 合并 key，引擎不认识它）。x-api-key 一起换，免得引擎优先读它。

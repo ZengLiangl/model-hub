@@ -20,6 +20,7 @@ hub/core/paths.py，启动横幅会打印**实际生效**的路径。
 """
 import argparse
 import os
+import secrets
 import sys
 import threading
 import time
@@ -35,6 +36,11 @@ else:
     from .core import paths
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# 门户统一登录的内部令牌：门户校验面板口令后带这个头转发给引擎，
+# 引擎在回环来源上认它，因此三家面板密码不需要保持一致。
+# 每次启动轮换；引擎与门户同进程，改环境变量即可生效。
+os.environ.setdefault("HUB_INTERNAL_TOKEN", secrets.token_urlsafe(32))
 # 目录表从注册表派生（第 100 轮）：加引擎不再改这里。
 ENGINE_DIRS = {name: os.path.join(HERE, "engines", meta["dir"]) for name, meta in ENGINE_META.items()}
 
