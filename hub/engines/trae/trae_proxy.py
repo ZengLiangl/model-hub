@@ -10601,8 +10601,15 @@ class Handler(BaseHTTPRequestHandler):
                                            platform=platform)
             except Exception as exc:
                 return self._error(502, "could not start login: %s" % exc)
+            # Trae 没有设备授权流程：明确回 501，而不是继续读 state 抛 KeyError
+            #（面板靠这个状态码把人切到 PAT/Desktop 页签）。
+            if (started or {}).get("status") == "unsupported":
+                return self._error(
+                    501, started.get("message")
+                    or "Trae 没有设备授权流程：请用 Desktop 导入，或粘贴 refreshToken",
+                    "invalid_request_error")
             log("oauth device login started (realm=%s, state=%s)"
-                % (target_realm, started["state"][:8]))
+                % (target_realm, (started.get("state") or "")[:8]))
             return self._json(200, started)
         if path == "/accounts/login/cancel":
             state = payload.get("state") or ""

@@ -395,6 +395,27 @@ export const importAccounts = (eng: Engine, accounts: unknown[]) =>
     API + "/" + eng + "/accounts/import", { accounts: accounts }, { timeoutMs: 120000 },
   );
 
+/** 导出账号（含凭证）：引擎返回导出文档，前端落成 JSON 文件，供另一台机器「JSON 文件」导入。 */
+export async function exportAccounts(eng: Engine, realm?: Realm): Promise<{ count: number; filename: string }> {
+  const doc = await get<{ accounts?: unknown[] }>(API + "/" + eng + "/accounts/export", {
+    query: { realm: realm, secrets: "1" },
+    timeoutMs: 60000,
+  });
+  const list = Array.isArray(doc?.accounts) ? doc.accounts : [];
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  const filename = eng + "-accounts-" + (realm || "all") + "-" + stamp + ".json";
+  const blob = new Blob([JSON.stringify(doc, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  return { count: list.length, filename: filename };
+}
+
 /** PAT 导入：只有 Qoder 有这条路由。 */
 export const importPat = (eng: Engine, pat: string, realm?: string) =>
   post<{ ok?: boolean; error?: string }>(API + "/" + eng + "/accounts/import/pat",

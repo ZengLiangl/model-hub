@@ -192,6 +192,9 @@ def port_free(host, port):
     """
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # 引擎自己（http.server）开了 allow_reuse_address；预检不开的话，
+    # 刚停掉实例留下的 TIME_WAIT 会让空闲端口被误判为占用。
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind((host, port))
         s.close()

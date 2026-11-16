@@ -1938,6 +1938,26 @@ def _appdata():
             or os.path.join(os.path.expanduser("~"), "AppData", "Roaming"))
 
 
+def _official_desktop_roots():
+    """两个官方客户端的数据根目录（按平台）。
+
+    Trae 是 VS Code 系客户端，userData 目录各平台不同：
+      Windows  %APPDATA%/Trae、%APPDATA%/Trae CN
+      macOS    ~/Library/Application Support/Trae、.../Trae CN
+      Linux    $XDG_CONFIG_HOME/Trae、.../Trae CN
+    之前只写了 Windows 路径，macOS 上扫描永远为空。
+    """
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
+    elif os.name == "nt" or sys.platform == "win32":
+        base = _appdata()
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    return [(os.path.join(base, "Trae"), "intl"),
+            (os.path.join(base, "Trae CN"), "cn")]
+
+
 def desktop_storage_paths():
     """候选 storage.json：TRAE_DESKTOP_DIRS 优先（测试用），否则两个官方目录。"""
     entries = []
@@ -1948,9 +1968,7 @@ def desktop_storage_paths():
         if part:
             roots.append((part, ""))
     if not roots:
-        appdata = _appdata()
-        roots = [(os.path.join(appdata, "Trae"), "intl"),
-                 (os.path.join(appdata, "Trae CN"), "cn")]
+        roots = _official_desktop_roots()
     for root, hint in roots:
         storage = os.path.join(root, "User", "globalStorage", "storage.json")
         if os.path.isfile(storage):

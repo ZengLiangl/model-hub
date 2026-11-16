@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { AlertTriangle, CalendarCheck, Coins, Info, Play, RefreshCw, RotateCcw, Search, Trash2, Upload, Users, Zap } from 'lucide-react';
+import { AlertTriangle, CalendarCheck, Coins, Download, Info, Play, RefreshCw, RotateCcw, Search, Trash2, Upload, Users, Zap } from 'lucide-react';
 import {
   Badge, Button, Card, Dialog, DialogContent, EmptyState, Input, SkeletonRows, Switch,
   TableWrap, Td, Th, Tr, useToast,
@@ -9,7 +9,7 @@ import {
 import { useLang } from '@/lib/i18n';
 import { ImportDialog } from './accounts-import';
 import { AccountDetail } from './accounts-detail';
-import { ENGINES, ENGINE_LABELS, checkinAccounts, engineTasks, deleteAccount, engineAccounts, refreshAccounts, runTask, setAccount, setAllAccounts, testAccount, triggerScheduler, type Account, type AccountsPayload, type Engine, type Realm } from '@/lib/api';
+import { ENGINES, ENGINE_LABELS, checkinAccounts, engineTasks, deleteAccount, engineAccounts, exportAccounts, refreshAccounts, runTask, setAccount, setAllAccounts, testAccount, triggerScheduler, type Account, type AccountsPayload, type Engine, type Realm } from '@/lib/api';
 
 const VIRTUAL_THRESHOLD = 40;
 
@@ -281,6 +281,18 @@ export default function AccountsView() {
   /** 列表正在取数（刷新按钮的 loading 用它） */
   const busy = list.isFetching;
 
+  // 导出当前引擎 + 当前区域的全部账号（含凭证），下载成 JSON 供别的机器导入
+  const exportAll = useMutation({
+    mutationFn: function () { return exportAccounts(engine, realm); },
+    onSuccess: function (res) {
+      toast.push(res.count > 0 ? 'ok' : 'warn',
+        res.count > 0
+          ? t('accounts.export.done', { n: String(res.count) })
+          : t('accounts.export.empty'));
+    },
+    onError: function (err) { toast.push('err', (err as Error).message); },
+  });
+
   return (
     <div className="flex flex-col gap-4">
       <Card
@@ -293,6 +305,9 @@ export default function AccountsView() {
             </Button>
             <Button size="sm" variant="primary" icon={<Upload size={13} />} onClick={function () { setImportOpen(true); }}>
               {t("accounts.import.title")}
+            </Button>
+            <Button size="sm" variant="ghost" icon={<Download size={13} />} loading={exportAll.isPending} onClick={function () { exportAll.mutate(); }}>
+              {t("accounts.export")}
             </Button>
             <Button size="sm" variant="ghost" icon={<CalendarCheck size={13} />} loading={checkin.isPending} onClick={function () { checkin.mutate(undefined); }}>
               {checkinProgress ? checkinProgress.done + "/" + checkinProgress.total : t("accounts.checkinAll")}
@@ -430,7 +445,7 @@ export default function AccountsView() {
         ) : null}
       </Dialog>
       <AccountDetail account={detail} engine={engine} onClose={function () { setDetail(null); }} />
-      <ImportDialog open={importOpen} onClose={function () { setImportOpen(false); }} engine={engine} />
+      <ImportDialog open={importOpen} onClose={function () { setImportOpen(false); }} engine={engine} realm={realm} />
     </div>
   );
 }

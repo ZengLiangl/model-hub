@@ -5,14 +5,14 @@ import { Button, Dialog, DialogContent, Field, Input, Textarea, useToast } from 
 import { useLang } from '@/lib/i18n';
 import {
   ENGINE_LABELS, importAccounts, importDesktop, importPat, oauthCancel, oauthPoll, oauthStart, scanDesktop,
-  type DesktopAccount, type Engine,
+  type DesktopAccount, type Engine, type Realm,
 } from '@/lib/api';
 
 /**
  * 导入账号：JSON 文件 / PAT / 桌面客户端扫描。
  * 三种方式都先「预检」再「确认」，避免一次性把脏数据灌进账号池。
  */
-export function ImportDialog(props: { open: boolean; onClose: () => void; engine: Engine }) {
+export function ImportDialog(props: { open: boolean; onClose: () => void; engine: Engine; realm?: Realm }) {
   const { t } = useLang();
   const toast = useToast();
   const qc = useQueryClient();
@@ -67,7 +67,8 @@ export function ImportDialog(props: { open: boolean; onClose: () => void; engine
   const scan = useMutation({
     mutationFn: function () { return scanDesktop(props.engine); },
     onSuccess: function (res) {
-      const rows = res?.accounts ?? [];
+      // 引擎的扫描结果在 detected（accounts 是「当前账号池」视图，扫描后通常还是空的）
+      const rows = res?.detected ?? res?.accounts ?? [];
       setScanned(rows);
       toast.push(rows.length ? 'ok' : 'warn', rows.length ? String(rows.length) : t('accounts.import.desktopNone'));
     },
@@ -75,16 +76,16 @@ export function ImportDialog(props: { open: boolean; onClose: () => void; engine
   });
 
   const importDesk = useMutation({
-    mutationFn: function (all: boolean) {
-      const uids = (scanned ?? []).map(function (a) { return String(a.uid ?? ''); }).filter(Boolean);
-      return importDesktop(props.engine, all ? { all: true } : { uids: uids });
+    mutationFn: function () {
+      // 三家引擎的导入接口都只认 {all:true} / {path}，uids 会被忽略成"再扫一次"
+      return importDesktop(props.engine, { all: true });
     },
     onSuccess: function (res) { done(t('accounts.import.desktopImported', { n: String(res?.added ?? 0) })); },
     onError: function (err) { toast.push('err', (err as Error).message); },
   });
 
   const usePat = useMutation({
-    mutationFn: function () { return importPat(props.engine, pat.trim()); },
+    mutationFn: function () { return importPat(props.engine, pat.trim(), props.realm); },
     onSuccess: function () { done(t('common.saved')); },
     onError: function (err) {
       const st = (err as { status?: number }).status;
@@ -112,7 +113,7 @@ export function ImportDialog(props: { open: boolean; onClose: () => void; engine
   }, [oauth]);
 
   const startOAuth = useMutation({
-    mutationFn: function () { return oauthStart(props.engine); },
+    mutationFn: function () { return oauthStart(props.engine, props.realm); },
     onSuccess: function (res) {
       if (!res?.state || !res?.authUrl) { toast.push('err', t('accounts.import.oauthFailed', { detail: 'no url' })); return; }
       setOauth({ state: res.state, url: res.authUrl });
@@ -134,6 +135,16 @@ export function ImportDialog(props: { open: boolean; onClose: () => void; engine
 
   const busy = importJson.isPending || scan.isPending || importDesk.isPending || usePat.isPending;
 
+  // Trae 没有设备授权流程（引擎 start_login 固定返回 unsupported），
+  // 不给 OAuth 页签，免得点进去只看到一条报错。
+  const allTabs: { id: 'json' | 'pat' | 'desktop' | 'oauth'; icon: typeof FileJson; label: string }[] = [
+    { id: 'json', icon: FileJson, label: t('accounts.import.json') },
+    { id: 'pat', icon: KeyRound, label: t('accounts.import.pat') },
+    { id: 'desktop', icon: MonitorDown, label: t('accounts.import.desktop') },
+    { id: 'oauth', icon: ShieldCheck, label: t('accounts.import.oauth') },
+  ];
+  const tabs = allTabs.filter(function (item) { return item.id !== 'oauth' || props.engine !== 'trae'; });
+
   return (
     <Dialog open={props.open} onOpenChange={function (v) { if (!v) closeAll(); }}>
       <DialogContent
@@ -154,7 +165,7 @@ export function ImportDialog(props: { open: boolean; onClose: () => void; engine
             ) : null}
             {tab === 'desktop' ? (
               scanned && scanned.length > 0 ? (
-                <Button variant="primary" loading={importDesk.isPending} onClick={function () { importDesk.mutate(false); }}>
+                <Button variant="primary" loading={importDesk.isPending} onClick={function () { importDesk.mutate(); }}>
                   {t('accounts.import.confirm')} ({scanned.length})
                 </Button>
               ) : (
@@ -167,19 +178,19 @@ export function ImportDialog(props: { open: boolean; onClose: () => void; engine
         )}
       >
         <div className="mb-3 flex gap-0.5 rounded-md border border-line-faint p-0.5" role="tablist">
-          {([['json', FileJson, t('accounts.import.json')], ['pat', KeyRound, t('accounts.import.pat')], ['desktop', MonitorDown, t('accounts.import.desktop')], ['oauth', ShieldCheck, t('accounts.import.oauth')]] as const).map(function (item) {
-            const Icon = item[1];
+          {tabs.map(function (item) {
+            const Icon = item.icon;
             return (
               <button
-                key={item[0]}
+                key={item.id}
                 role="tab"
-                aria-selected={tab === item[0]}
-                onClick={function () { setTab(item[0]); }}
+                aria-selected={tab === item.id}
+                onClick={function () { setTab(item.id); }}
                 className={'flex h-7 flex-1 cursor-pointer items-center justify-center gap-1.5 rounded px-2 text-[11.5px] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent ' +
-                  (tab === item[0] ? 'bg-surface-2 font-medium text-fg' : 'text-fg-dim hover:bg-surface-2/70')}
+                  (tab === item.id ? 'bg-surface-2 font-medium text-fg' : 'text-fg-dim hover:bg-surface-2/70')}
               >
                 <Icon size={12} aria-hidden="true" />
-                {item[2]}
+                {item.label}
               </button>
             );
           })}
@@ -225,9 +236,12 @@ export function ImportDialog(props: { open: boolean; onClose: () => void; engine
             ) : (
               <ul className="max-h-40 overflow-auto rounded-md border border-line-faint">
                 {scanned.map(function (a, i) {
+                  // 引擎返回的是脱敏视图：昵称常嵌在 account.username 里
+                  const inner = (a.account ?? {}) as { username?: string };
                   return (
                     <li key={String(a.uid ?? i)} className="flex items-center gap-2 border-b border-line-faint px-2 py-1 text-[11.5px] last:border-0">
-                      <span className="min-w-0 flex-1 truncate text-fg-dim">{String(a.nickname ?? a.email ?? a.uid ?? '—')}</span>
+                      <span className="min-w-0 flex-1 truncate text-fg-dim">{String(a.nickname ?? a.email ?? inner.username ?? a.uid ?? '—')}</span>
+                      <span className="shrink-0 text-[10px] text-fg-mute">{String(a.realmName ?? a.realm ?? '')}</span>
                       <span className="shrink-0 font-mono text-[10px] text-fg-mute">{String(a.uid ?? '').slice(0, 8)}</span>
                     </li>
                   );

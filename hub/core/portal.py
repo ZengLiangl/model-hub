@@ -1508,7 +1508,10 @@ class PortalHandler(BaseHTTPRequestHandler):
 
 class PortalServer(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = False          # 端口被占就报错，不偷偷接管别人的监听
+    # 开 SO_REUSEADDR：macOS 上刚停掉的实例会留下 TIME_WAIT，不开会 bind 失败；
+    # 它不会接管**正在监听**的端口（那需要 SO_REUSEPORT），兜底判断仍由
+    # 启动前的 port_free 预检负责。
+    allow_reuse_address = True
 
     def __init__(self, addr, handler, ports, admin_dir, default_engine="wb",
                  proxy_timeout=120, quiet=False):
