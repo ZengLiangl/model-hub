@@ -106,8 +106,11 @@ export default function OverviewView() {
   const usageAllFailed = (usage.data?.failed?.length ?? 0) === ENGINES.length;
   const allFailed = health.isError || usageAllFailed;
   const loading = usage.isPending || health.isPending;
-  const empty = !loading && !allFailed && totals.requests === 0 && accountTotals.total === 0;
-  const successRate = ratio(totals.requests - totals.errors, totals.requests);
+  // requests 是「成功」计数，errors 是「失败」计数；总尝试数 = 两者之和。
+  // 之前用 (requests - errors) / requests，失败多于成功时会算出 -188.9%。
+  const attempts = totals.requests + totals.errors;
+  const empty = !loading && !allFailed && attempts === 0 && accountTotals.total === 0;
+  const successRate = ratio(totals.requests, attempts);
 
   function retryAll() {
     void health.refetch(); void usage.refetch(); void logs.refetch();
@@ -167,7 +170,7 @@ export default function OverviewView() {
 
       {/* KPI 条 */}
       <div className="grid gap-3 @lg:grid-cols-2 @3xl:grid-cols-4">
-        <Kpi label={t('overview.kpi.requests')} value={fmt(totals.requests)} hint={t('engine.online', { up: String(ENGINES.filter(function (e) { return engines[e] && engines[e].ok !== false; }).length), total: String(ENGINES.length) })} />
+        <Kpi label={t('overview.kpi.requests')} value={fmt(attempts)} hint={t('engine.online', { up: String(ENGINES.filter(function (e) { return engines[e] && engines[e].ok !== false; }).length), total: String(ENGINES.length) })} />
         <Kpi label={t('overview.kpi.errors')} value={fmt(totals.errors)} hint={successRate === undefined ? '—' : t('metrics.successRate') + ' ' + successRate.toFixed(1) + '%'} tone={totals.errors > 0 ? 'err' : undefined} />
         <Kpi label={t('overview.kpi.tokens')} value={fmt(totals.tokens)} hint={t('overview.pool.ready') + ' ' + fmt(accountTotals.ready) + ' / ' + fmt(accountTotals.total)} />
         <Kpi label={t('overview.kpi.cost')} value={totals.cost > 0 ? money(totals.cost) : t('overview.kpi.noPricing')} hint={totals.credit > 0 ? t('overview.kpi.credits') + ' ' + fmt(totals.credit) : undefined} />
@@ -192,13 +195,13 @@ export default function OverviewView() {
         <Card title={t('metrics.successRate')}>
           <div className="flex items-center gap-4">
             <Donut
-              segments={[{ value: Math.max(0, totals.requests - totals.errors), tone: 'accent-2' }, { value: totals.errors, tone: 'err' }]}
+              segments={[{ value: totals.requests, tone: 'accent-2' }, { value: totals.errors, tone: 'err' }]}
               centerLabel={successRate === undefined ? '—' : successRate.toFixed(1) + '%'}
               centerHint={t('metrics.successRate')}
               ariaLabel={t('metrics.successRate')}
             />
             <ul className="flex flex-col gap-1.5 text-[11.5px]">
-              <li className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full" style={{ background: 'var(--accent-2)' }} />{t('common.ok')} <span className="tnum text-fg-mute">{fmt(Math.max(0, totals.requests - totals.errors))}</span></li>
+              <li className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full" style={{ background: 'var(--accent-2)' }} />{t('common.ok')} <span className="tnum text-fg-mute">{fmt(totals.requests)}</span></li>
               <li className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full" style={{ background: 'var(--err)' }} />{t('common.error')} <span className="tnum text-fg-mute">{fmt(totals.errors)}</span></li>
             </ul>
           </div>
