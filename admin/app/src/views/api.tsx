@@ -6,10 +6,10 @@ import {
   Badge, Button, Card, EmptyState, EngineBadge, SkeletonRows, TableWrap, Td, Th, Tr, useToast,
 } from '@/components/ui';
 import { useLang } from '@/lib/i18n';
-import { ENGINE_LABELS, ENGINES, hubHealth, hubKeys, type Engine } from '@/lib/api';
+import { API, ENGINE_LABELS, ENGINES, hubHealth, hubKeys, type Engine } from '@/lib/api';
 
-/** 门户对外只有一个地址：<origin>/api/v1。所有引擎都在它后面。 */
-const API_PATH = "/api/v1";
+/** 门户对外只有一个地址：<origin><API>/v1（子路径反代时为 /hub/api/v1）。 */
+const API_PATH = API + "/v1";
 
 type CopyTarget = "base" | "models" | "chat";
 

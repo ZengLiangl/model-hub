@@ -4,7 +4,8 @@ import tailwindcss from '@tailwindcss/vite';
 import { fileURLToPath, URL } from 'node:url';
 
 export default defineConfig({
-  base: './',
+  // 子路径部署时用 VITE_BASE=/hub/ 打包；默认相对路径，根路径与 /hub/ 都能用
+  base: process.env.VITE_BASE || './',
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },

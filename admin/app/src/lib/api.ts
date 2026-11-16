@@ -8,8 +8,25 @@
 
 import { get, post, ApiError, readToken, writeToken, setBase, type EngineId , setEngineTokenRefresher } from "./http";
 
-/** 门户的接口全在 /api 下（静态资源在根）。所有请求都必须带这个前缀。 */
-export const API = "/api";
+/**
+ * 门户的接口全在 /api 下（静态资源在根）。所有请求都必须带这个前缀。
+ *
+ * 用 document.baseURI 推导而不是写死 "/api"：
+ *  · 根路径部署 → /api
+ *  · 子路径反代（如 https://host/hub/）→ /hub/api
+ * 面板用 hash 路由，页面 URL 始终停在挂载点，所以相对推导是稳定的。
+ */
+export const API = (function () {
+  // 构建期显式指定（如 VITE_API_BASE=/hub/api）优先，便于固定前缀
+  const fromEnv = import.meta.env.VITE_API_BASE;
+  if (fromEnv) return fromEnv.replace(/\/$/, "");
+  try {
+    const path = new URL("api", document.baseURI).pathname;
+    return path.replace(/\/$/, "") || "/api";
+  } catch {
+    return "/api";
+  }
+})();
 
 export const ENGINES = ["wb", "qd", "trae"] as const;
 export type Engine = (typeof ENGINES)[number];
