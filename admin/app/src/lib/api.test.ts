@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { __resetInflight, engineOfPath, readToken, writeToken, request, get } from '@/lib/http';
-import { login, fanout, ENGINES } from '@/lib/api';
+import { login, fanout, ENGINES, probeKey } from '@/lib/api';
 
 type Call = { url: string; init: RequestInit };
 let calls: Call[] = [];
@@ -125,6 +125,15 @@ describe('逐引擎令牌槽（每家令牌独立）', () => {
     expect(readToken("wb")).toBe("wb-tk");
     expect(readToken("qd")).toBe("qd-tk");
     expect(readToken("trae")).toBe("trae-tk");
+  });
+});
+
+describe('api.probeKey', () => {
+  it('走 API 前缀，子路径部署下不会打到静态站点', async () => {
+    mockFetch(() => json({ object: "list", data: [] }));
+    const r = await probeKey("mrg-test");
+    expect(r.ok).toBe(true);
+    expect(calls[0].url).toBe("/api/v1/models");
   });
 });
 

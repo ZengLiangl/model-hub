@@ -601,7 +601,8 @@ export async function probeKey(key: string): Promise<{ ok: boolean; status: numb
   const token = String(key || "").trim();
   if (!token) return { ok: false, status: 0, detail: "empty" };
   try {
-    const res = await fetch("/v1/models", { headers: { Authorization: "Bearer " + token } });
+    // 必须带 API 前缀：子路径部署（/hub/）下写死 /v1/models 会落到静态站点 404
+    const res = await fetch(API + "/v1/models", { headers: { Authorization: "Bearer " + token } });
     if (res.ok) return { ok: true, status: res.status, detail: "" };
     let detail = "";
     try {
