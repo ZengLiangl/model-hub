@@ -36,7 +36,9 @@ export default function OverviewView() {
   const navigate = useNavigate();
 
   const health = useQuery({ queryKey: ['hub-health'], queryFn: hubHealth });
-  const usage = useQuery({ queryKey: ['overview-usage'], queryFn: () => fanout(async (eng: Engine) => engineUsage(eng)) });
+  // 总览统计必须跨区域：引擎默认只报「当前区域」，账号在 cn、引擎跑在 intl 时
+  // 成功请求会被过滤成 0，只剩失败数，看起来像统计坏了。
+  const usage = useQuery({ queryKey: ['overview-usage'], queryFn: () => fanout(async (eng: Engine) => engineUsage(eng, 'all')) });
   const logs = useQuery({
     queryKey: ['overview-logs'],
     queryFn: async () => {

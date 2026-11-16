@@ -226,7 +226,8 @@ export type UsagePayload = {
   [k: string]: unknown;
 };
 
-export const engineUsage = (eng: Engine) => get<UsagePayload>(API + "/" + eng + "/usage");
+export const engineUsage = (eng: Engine, realm?: string) =>
+  get<UsagePayload>(API + "/" + eng + "/usage", realm ? { query: { realm: realm } } : undefined);
 
 export type SettingsPayload = Record<string, unknown> & {
   api_keys?: ApiKey[];
