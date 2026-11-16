@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { __resetInflight, readToken, writeToken, request, get } from '@/lib/http';
+import { __resetInflight, engineOfPath, readToken, writeToken, request, get } from '@/lib/http';
 import { login, fanout, ENGINES } from '@/lib/api';
 
 type Call = { url: string; init: RequestInit };
@@ -34,6 +34,21 @@ describe('http', () => {
   it('401 抛 ApiError(kind=unauthorized)', async () => {
     mockFetch(() => json({ error: "nope" }, 401));
     await expect(get("/api/wb/accounts")).rejects.toMatchObject({ status: 401, kind: "unauthorized" });
+  });
+
+  it('engineOfPath 能识别 /hub 子路径反代', async () => {
+    expect(engineOfPath("/hub/api/qd/usage")).toBe("qd");
+    expect(engineOfPath("/hub/api/trae/logs")).toBe("trae");
+    expect(engineOfPath("/api/wb/settings")).toBe("wb");
+    expect(engineOfPath("/hub/api/hub/health")).toBeUndefined();
+
+    // 子路径下也必须用 qd 自己的槽位，不能回落到 wb 主令牌
+    writeToken("wb-main");
+    writeToken("qd-tk", "qd");
+    mockFetch(() => json({ ok: true }));
+    await get("/hub/api/qd/usage");
+    const h = calls[0].init.headers as Record<string, string>;
+    expect(h["X-Panel-Token"]).toBe("qd-tk");
   });
 
   it('qd/trae 未登录的 401 不清主会话，只有主槽 401 才登出', async () => {

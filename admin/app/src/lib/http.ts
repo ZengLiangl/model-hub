@@ -65,9 +65,11 @@ export function writeToken(token: string, engine?: EngineId): void {
   } catch { /* 隐私模式忽略 */ }
 }
 
-/** 从请求路径推断引擎：/api/wb/... → wb。取不到返回 undefined（用主槽）。 */
+/** 从请求路径推断引擎：/api/wb/... → wb。
+ *  前面允许任意前缀，兼容子路径反代（/hub/api/qd/usage → qd）。
+ *  认错引擎会拿 wb 的主令牌去打别家，结果就是登录成功但管理接口全 401。 */
 export function engineOfPath(path: string): EngineId | undefined {
-  const m = /^\/api\/(wb|qd|trae)(\/|$)/.exec(path);
+  const m = /(?:^|\/)api\/(wb|qd|trae)(?:\/|$)/.exec(path);
   return m ? (m[1] as EngineId) : undefined;
 }
 
