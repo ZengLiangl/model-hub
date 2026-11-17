@@ -96,14 +96,17 @@ H.check("R09 单区 -> realm_exclusive=True", one and one[0]["realm_exclusive"] 
 s = snap({"wb": {"cn": {"b", "a"}}}, {})
 H.eq("R10 合并清单按 id 排序", [d["id"] for d in router.merged_model_list(s)], ["a", "b"])
 
-# ---------- 只发有账号的引擎（第 245 轮）----------
+# ---------- 只发有账号的「引擎 × 区域」（第 245/246 轮）----------
 # 由来：引擎的 /v1/models 是「目录」，与有没有登录号无关 —— trae 池子空着也照样
 # 倒出整份静态清单，于是合并清单里全是点不动的模型（实测 DeepSeek-V4-Flash 只挂在
-# trae 上）。快照因此多记一个 /health.accounts（账号总数），0 个号的引擎不发。
+# trae 上）。再细一层是**区域**：wb 有号但没有国际区的号时，wb intl 目录照样被合并
+# 进来（实测 kimi-k3.1-pro-highspeed 只在 wb intl 目录里）。
+# 快照因此多记两个数：/health.accounts（总数）与 accounts_by_realm（按区）。
 class SnapAcct(Snapshot):
-    def __init__(self, models=None, ready=None, accounts=None):
+    def __init__(self, models=None, ready=None, accounts=None, by_realm=None):
         Snapshot.__init__(self, models=models, ready=ready)
         self.accounts = accounts or {}
+        self.accounts_by_realm = by_realm or {}
 
 
 s = SnapAcct({"wb": {"cn": {"m"}}, "trae": {"cn": {"only-trae"}, "intl": {"only-trae"}}},
@@ -133,12 +136,45 @@ H.eq("R25b engine_has_accounts：未知=True / 0=False / 正数=True",
       router.engine_has_accounts(SnapAcct({}, {}, {"trae": 0}), "trae"),
       router.engine_has_accounts(SnapAcct({}, {}, {"trae": 2}), "trae")),
      (True, False, True))
-H.eq("R25c publishing_engines：有号才发 / 一家都没号时全发",
-     (router.publishing_engines(SnapAcct({}, {}, {"wb": 1, "qd": 0, "trae": 0})),
-      router.publishing_engines(SnapAcct({}, {}, {"wb": 0, "qd": 0, "trae": 0}))),
-     (["wb"], list(router.ENGINES)))
+H.eq("R25c publishing_realms：有号才发 / 一家都没号时全发",
+     (router.publishing_realms(SnapAcct({}, {}, {"wb": 1, "qd": 0, "trae": 0})),
+      router.publishing_realms(SnapAcct({}, {}, {"wb": 0, "qd": 0, "trae": 0}))),
+     ({"wb": list(router.REALMS), "qd": [], "trae": []},
+      {e: list(router.REALMS) for e in router.ENGINES}))
 
-# 阳性对照：把过滤去掉（等价于老实现）必须让 R22 判红 —— 防止判据本身写空。
+# ---- 区域一层（第 246 轮）：wb 有号、但只有国内区的号 ----
+s = SnapAcct({"wb": {"cn": {"glm-cn"}, "intl": {"kimi-k3.1-pro-highspeed"}}},
+             {}, {"wb": 2}, {"wb": {"cn": 2}})
+H.eq("R27 只有国内区号 -> wb 的 intl 目录整段不发（国际区独有模型不返回）",
+     [d["id"] for d in router.merged_model_list(s)], ["glm-cn"])
+H.eq("R27b publishing_realms 报出按区收窄的结果",
+     router.publishing_realms(s)["wb"], ["cn"])
+
+s = SnapAcct({"wb": {"cn": {"glm-cn"}, "intl": {"kimi"}}}, {}, {"wb": 2},
+             {"wb": {"cn": 2, "intl": 0}})
+H.eq("R28 按区表里显式 0 与缺键等价（都是「该区没号」）",
+     [d["id"] for d in router.merged_model_list(s)], ["glm-cn"])
+
+# 护栏：有号、但按区表里一个 REALMS 的区都对不上（账号 realm 没填成 ""）——
+# 不能把它摘光，那等于把「有号」误判成「没号」。
+s = SnapAcct({"wb": {"cn": {"glm-cn"}, "intl": {"kimi"}}}, {}, {"wb": 2}, {"wb": {"": 2}})
+H.eq("R28b 按区表对不上 REALMS 时退回两区（不把有号的引擎摘光）",
+     (router.publishing_realms(s)["wb"],
+      [d["id"] for d in router.merged_model_list(s)]), (list(router.REALMS), ["glm-cn", "kimi"]))
+
+s = SnapAcct({"wb": {"cn": {"glm-cn"}}, "qd": {"cn": {"q-cn"}, "intl": {"q-intl"}}},
+             {}, {"wb": 2, "qd": 1, "trae": 0}, {"wb": {"cn": 2}})   # qd 没报按区 -> 两区照发
+H.eq("R29 没报按区数的引擎（qd/trae）两区照发 —— 不拿猜测删区",
+     router.publishing_realms(s), {"wb": ["cn"], "qd": list(router.REALMS), "trae": []})
+H.eq("R29b 清单里 qd 的国际区模型仍在", [d["id"] for d in router.merged_model_list(s)],
+     ["glm-cn", "q-cn", "q-intl"])
+
+s = SnapAcct({"wb": {"cn": {"glm-cn"}}}, {}, {"wb": 0, "qd": 0, "trae": 0},
+             {"wb": {"cn": 0}})
+H.eq("R30 按区表全 0 且三家总数都是 0 -> 退回目录视图",
+     [d["id"] for d in router.merged_model_list(s)], ["glm-cn"])
+
+# 阳性对照：把过滤去掉（等价于老实现）必须让 R22/R27 判红 —— 防止判据本身写空。
 class _Unfiltered(object):
     @staticmethod
     def merged_model_list(snapshot):
@@ -154,6 +190,10 @@ _bad = _Unfiltered.merged_model_list(
     SnapAcct({"trae": {"cn": {"only-trae"}}}, {}, {"wb": 1, "trae": 0}))
 H.check("R26 阳性对照：不过滤时 only-trae 会漏出来（判据不是空的）",
         any(d["id"] == "only-trae" for d in _bad), _bad)
+_bad2 = _Unfiltered.merged_model_list(
+    SnapAcct({"wb": {"intl": {"kimi-k3.1-pro-highspeed"}}}, {}, {"wb": 2}, {"wb": {"cn": 2}}))
+H.check("R31 阳性对照：不过滤时 wb 的国际区模型会漏出来",
+        any(d["id"] == "kimi-k3.1-pro-highspeed" for d in _bad2), _bad2)
 
 # ---------- 三协议 model 提取 ----------
 for label, doc in (("chat", {"model": "glm-5.3-flash", "messages": []}),

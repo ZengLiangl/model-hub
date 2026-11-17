@@ -905,20 +905,20 @@ class PortalHandler(BaseHTTPRequestHandler):
             snapshot = router.refresh_snapshot(self.server.ports, upstream,
                                                self.server.route_snapshot)
             counts = {"merged": len(router.merged_model_list(snapshot))}
-            publish = set(router.publishing_engines(snapshot))
+            publish = router.publishing_realms(snapshot)
             hidden = {}
             for engine in ENGINES:
                 realms = (snapshot.models or {}).get(engine) or {}
-                n = sum(len(ids) for ids in realms.values())
-                if engine in publish:
-                    counts[engine] = n
-                    continue
-                # 没号引擎的条目压根不进合并清单 —— 这里也按 0 计，
-                # 否则 "merged ≥ 单边最大" 那条自检会被一份不发出去的清单判红。
-                counts[engine] = 0
-                if n:
-                    hidden[engine] = n
+                keep = publish.get(engine) or []
+                n_keep = sum(len(ids) for r, ids in realms.items() if r in keep)
+                n_hide = sum(len(ids) for r, ids in realms.items() if r not in keep)
+                counts[engine] = n_keep
+                # 没发出去的那部分（没号的引擎 / 没号的区）按 0 计 —— 否则
+                # "merged ≥ 单边最大" 那条自检会被一份不发出去的清单判红。
+                if n_hide:
+                    hidden[engine] = n_hide
             out["live"] = counts
+            out["realms"] = {e: list(publish.get(e) or []) for e in ENGINES}
             if hidden:
                 out["hidden"] = hidden
             out["available"] = True
@@ -1226,21 +1226,21 @@ class PortalHandler(BaseHTTPRequestHandler):
                                            self.server.route_snapshot)
         if lower_path(rest) in ("v1/models", "models"):
             data = router.merged_model_list(snapshot)
-            publish = set(router.publishing_engines(snapshot))
+            publish = router.publishing_realms(snapshot)
             counts, hidden = {}, {}
             for engine, realms in (snapshot.models or {}).items():
-                n = sum(len(ids) for ids in (realms or {}).values())
-                if engine in publish:
-                    counts[engine] = n
-                    continue
-                # ★ 没有账号的引擎：模型整段不发布（口径在 router.publishing_engines）。
-                #   这里把「摘掉了多少条」留在响应里 —— 排障时不必去猜清单为什么
-                #   比引擎自己报的少；客户端照旧只看 data。
-                counts[engine] = 0
-                if n:
-                    hidden[engine] = n
+                keep = publish.get(engine) or []
+                n_keep = sum(len(ids) for r, ids in (realms or {}).items() if r in keep)
+                n_hide = sum(len(ids) for r, ids in (realms or {}).items() if r not in keep)
+                counts[engine] = n_keep
+                # ★ 没发出去的那部分（没号的引擎 / 没号的区）按条数记在 hidden 里。
+                #   排障时不必去猜清单为什么比引擎自己报的少；客户端照旧只看 data。
+                if n_hide:
+                    hidden[engine] = n_hide
             body = {"object": "list", "data": data,
                     "merged": True, "counts": counts,
+                    # 发布范围：{引擎: [区...]}，一眼看出「wb 只发 cn」这类收窄。
+                    "realms": {e: list(publish.get(e) or []) for e in ENGINES},
                     "route": cfg}
             if hidden:
                 body["hidden"] = hidden

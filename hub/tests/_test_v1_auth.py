@@ -34,20 +34,33 @@ class FakeEngine(BaseHTTPRequestHandler):
     name = "wb"
     fail_status = 0        # 0 = 正常；503 之类 = 该引擎的 chat 直接失败
     accounts = 1           # /health 报的**账号总数**（0 = 池子空着，第 245 轮的判据用它）
+    by_realm = None        # /health 的 accounts_by_realm（只有 wb 报；None = 不报）
+    realm_models = None    # {realm: [id...]}；None = 两个区都给同一份
 
     def log_message(self, *a):        # 静音
         pass
 
     def do_GET(self):
-        path = self.path.split("?")[0].rstrip("/") or "/"
-        if path.endswith("/health"):
+        full = self.path.split("?")[0].rstrip("/") or "/"
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        realm = "cn"
+        for part in query.split("&"):
+            if part.startswith("realm="):
+                realm = part.split("=", 1)[1]
+        if full.endswith("/health"):
             body = {"ok": True, "service": self.name + "-svc", "version": "1.0.0",
                     "accounts": self.accounts,
-                    "accounts_ready": 1 if self.accounts else 0, "realm": "cn"}
-        elif path.endswith("/v1/models"):
-            # 每家都给一个**同名**模型：只有候选集合里同时有它，路由才会跨引擎回退。
-            body = {"data": [{"id": self.name + "-model", "object": "model"},
-                             {"id": "common-model", "object": "model"}]}
+                    "accounts_ready": 1 if self.accounts else 0, "realm": realm}
+            if self.by_realm is not None:
+                body["accounts_by_realm"] = dict(self.by_realm)
+        elif full.endswith("/v1/models"):
+            if self.realm_models is not None:
+                body = {"data": [{"id": x, "object": "model"}
+                                 for x in self.realm_models.get(realm, [])]}
+            else:
+                # 每家都给一个**同名**模型：只有候选集合里同时有它，路由才会跨引擎回退。
+                body = {"data": [{"id": self.name + "-model", "object": "model"},
+                                 {"id": "common-model", "object": "model"}]}
         else:
             body = {}
         raw = json.dumps(body).encode()
@@ -79,9 +92,10 @@ class FakeEngine(BaseHTTPRequestHandler):
 FAKE_CLASSES = {}
 
 
-def start_fake(name, fail_status=0, accounts=1):
+def start_fake(name, fail_status=0, accounts=1, by_realm=None, realm_models=None):
     cls = type("Fake_" + name, (FakeEngine,),
-               {"name": name, "fail_status": fail_status, "accounts": accounts})
+               {"name": name, "fail_status": fail_status, "accounts": accounts,
+                "by_realm": by_realm, "realm_models": realm_models})
     FAKE_CLASSES[name] = cls          # 留个引用：后面要运行时改"谁失败"
     srv = ThreadingHTTPServer(("127.0.0.1", 0), cls)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -152,8 +166,8 @@ if not wait_portal():
 H.check("V00 门户在测试里起得来", True, "")
 
 
-def call_models(key, base_url=None):
-    req = urllib.request.Request((base_url or base) + "/api/v1/models")
+def call_models(key, base_url=None, query=""):
+    req = urllib.request.Request((base_url or base) + "/api/v1/models" + query)
     if key:
         req.add_header("Authorization", "Bearer " + key)
     try:
@@ -366,5 +380,71 @@ else:
     H.check("V12 账号数不再为 0 时清单恢复（口径只看当前快照）",
             status == 200 and "trae-model" in ids_of(doc4),
             "status=%s ids=%s" % (status, ids_of(doc4)))
+
+# ---- V2x 再细分到**区域**：wb 有号、但只有国内区的号（第 246 轮）----
+# 由来：wb 的 intl 目录里有国际版独有模型（实测 kimi-k3.1-pro-highspeed），
+# 没有国际区账号时它一样点不动。wb 的 /health 报 accounts_by_realm，据此收窄。
+CLS3 = {
+    "wb": {"accounts": 2, "by_realm": {"cn": 2},
+           "realm_models": {"cn": ["wb-cn-model"], "intl": ["kimi-k3.1-pro-highspeed"]}},
+    "qd": {"accounts": 1, "by_realm": None,                 # qd 不报按区 -> 两区照发
+           "realm_models": {"cn": ["qd-cn-model"], "intl": ["qd-intl-model"]}},
+    "trae": {"accounts": 0},
+}
+ports3, servers3 = {}, []
+for eng in ENGINES:
+    spec = dict(CLS3.get(eng) or {})
+    srv3, port3 = start_fake(eng, **spec)
+    servers3.append(srv3)
+    ports3[eng] = port3
+
+portal3_port = H.free_port()
+argv3 = ["--host", "127.0.0.1", "--port", str(portal3_port)]
+for eng in ENGINES:
+    argv3 += ["--%s-port" % eng, str(ports3[eng])]
+threading.Thread(target=portal.main, args=(argv3,), daemon=True).start()
+base3 = "http://127.0.0.1:%d" % portal3_port
+
+
+def wait_portal3(limit=15.0):
+    import time
+    end = time.time() + limit
+    while time.time() < end:
+        try:
+            with urllib.request.urlopen(base3 + "/api/hub/health", timeout=2) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+if not wait_portal3():
+    H.check("V20 第三个门户（wb 只有国内区号）起得来", False, "15s 内没应答 /api/hub/health")
+else:
+    status, doc5 = call_models("mk-all", base3)
+    ids = ids_of(doc5)
+    H.check("V20 wb 没有国际区号 -> 国际版独有模型不返回（国内区照发）",
+            status == 200 and "kimi-k3.1-pro-highspeed" not in ids
+            and "wb-cn-model" in ids, "status=%s ids=%s" % (status, ids))
+    H.check("V20b 没报按区数的引擎照发两区（qd 的国际区模型还在）",
+            "qd-cn-model" in ids and "qd-intl-model" in ids, ids)
+    H.check("V20c realms 字段说清发布范围",
+            ((doc5 or {}).get("realms") or {}) == {"wb": ["cn"],
+                                                   "qd": ["cn", "intl"], "trae": []},
+            (doc5 or {}).get("realms"))
+    counts = (doc5 or {}).get("counts") or {}
+    check_map = {"wb": 1, "qd": 2, "trae": 0}      # 按区累加：wb 只剩 cn 那 1 条
+    H.check("V20d counts 按发布的区累加", counts == check_map, counts)
+    hidden = (doc5 or {}).get("hidden") or {}
+    H.check("V20e 被区收窄摘掉的那 1 条记在 hidden.wb",
+            hidden.get("wb") == 1 and (hidden.get("qd") or 0) == 0, hidden)
+
+    # 反向对照：wb 自己的目录不删 —— 引擎 key 打 intl 仍能看到那份国际区目录
+    status, doc6 = call_models("ek-wb", base3, "?realm=intl")
+    H.check("V21 引擎 key + ?realm=intl 仍能拿到 wb 的国际区目录（不发 != 删）",
+            status == 200 and "kimi-k3.1-pro-highspeed" in ids_of(doc6),
+            "status=%s ids=%s" % (status, ids_of(doc6)))
 
 H.finish()

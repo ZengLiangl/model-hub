@@ -522,11 +522,15 @@ def _engine_has_accounts(engine, ports):
 
 
 def _publishing_engines(ports):
-    """这一轮对外发布哪几家 —— 与 hub/core/router.py 的 publishing_engines 同一口径。
+    """这一轮对外发布哪几家 —— 只按「引擎有没有号」判，不细分区域。
 
-    只摘「确知 0 个号」的引擎，不知道就当有；但**一家号都没有**时退回目录视图
-    （那是还没配好的首次运行状态，发空清单更糟）。两处必须同口径，否则
-    `/api/v1/models` 与 `/api/hub/models` 会互相打脸。
+    与 hub/core/router.py 的 publishing_realms 同一套取舍：只摘「确知 0 个号」的
+    引擎，不知道就当有；**一家号都没有**时退回目录视图（那是还没配好的首次运行
+    状态，发空清单更糟）。
+
+    为什么这里不按区收窄：本函数取的是 `/v1/models`（**不带 realm**，即引擎自己
+    当前那个区），没有区这一维可筛；按区收窄落在合并清单 `/api/v1/models` 上
+    （那边按 (引擎, 区) 逐对取数）。面板要按区看，本来就有 cn/intl 切换。
     """
     have = [e for e in ENGINES if _engine_has_accounts(e, ports)]
     return have or list(ENGINES)
