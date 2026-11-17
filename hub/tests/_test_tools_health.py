@@ -175,4 +175,48 @@ H.check("T07 控制台编码兜底存在（中文 Windows GBK 下 ✅ 会让成�
         "reconfigure(errors=" in sync_src,
         "缺 reconfigure(errors=...) —— 同步成功也会被当成失败")
 
+
+# ---- T10/T11：目录缓存归一化工具（第 249 轮）----
+# 由来：hub/engines/wb/catalog/product-config-cn.json 是上游 /v3/config 的落盘存档，
+# 上游每轮回包都换一个 requestId —— 于是这份被跟踪的文件**每轮都脏**，提交历史里
+# 堆满「只有 requestId 变了」的空提交（实测 2026-11-17 连推两次都是它）。
+# 工具把易变键换成固定占位符；这里钉住三件事：默认不写盘、幂等、--check 语义。
+import json as _json          # noqa: E402
+import tempfile as _tempfile  # noqa: E402
+
+_norm = os.path.join(TOOLS_DIR, "normalize_catalog.py")
+if os.path.isfile(_norm):
+    _td = _tempfile.mkdtemp(prefix="hub-norm-")
+    _f = os.path.join(_td, "product-config-cn.json")
+    _raw = '{"code": 0, "msg": "OK", "requestId": "abc-123", "data": {"models": [1, 2]}}'
+    with open(_f, "w", encoding="utf-8") as fh:
+        fh.write(_raw)
+
+    def _run(*args):
+        return subprocess.run([sys.executable, _norm] + list(args), cwd=P.REPO,
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=60)
+
+    _rc = _run(_f).returncode                    # 不带 --write：只报告
+    with open(_f, encoding="utf-8") as fh:
+        _after = fh.read()
+    H.check("T10 归一化工具默认不写盘（只报告）", _rc == 0 and _after == _raw,
+            "rc=%s changed=%s" % (_rc, _after != _raw))
+
+    _rc = _run(_f, "--check").returncode          # --check：需要归一化 -> 1
+    H.check("T10b --check 在需要归一化时退出码 1（CI 可用）", _rc == 1, "rc=%s" % _rc)
+
+    _rc = _run(_f, "--write").returncode
+    with open(_f, encoding="utf-8") as fh:
+        _doc = _json.load(fh)
+    H.check("T11 --write 只把易变键换成占位符，其余原样",
+            _rc == 0 and _doc.get("requestId") == "normalized-by-hub-tools"
+            and _doc.get("code") == 0 and (_doc.get("data") or {}).get("models") == [1, 2],
+            _json.dumps(_doc, ensure_ascii=False)[:120])
+
+    _rc = _run(_f, "--check").returncode          # 幂等：已归一化 -> 0
+    H.check("T11b 幂等：已归一化后 --check 退出码 0", _rc == 0, "rc=%s" % _rc)
+else:
+    H.check("T10 normalize_catalog.py 存在", False, "缺 hub/tools/normalize_catalog.py")
+
 H.finish()
