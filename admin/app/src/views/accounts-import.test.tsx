@@ -26,14 +26,14 @@ const json = (body: unknown, status = 200) =>
 // Radix 弹层会给 body 加 pointer-events:none，默认的 userEvent 会拒绝点击
 const user = () => userEvent.setup({ pointerEventsCheck: 0 });
 
-function renderDialog() {
+function renderDialog(engine: 'wb' | 'qd' | 'trae' = 'wb') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
   const onClose = vi.fn();
   render(
     <QueryClientProvider client={qc}>
       <LangProvider>
         <ToastProvider>
-          <ImportDialog open={true} onClose={onClose} engine="wb" />
+          <ImportDialog open={true} onClose={onClose} engine={engine} />
         </ToastProvider>
       </LangProvider>
     </QueryClientProvider>,
@@ -88,13 +88,19 @@ describe('ImportDialog', () => {
     expect(calls.some((c) => c.method === 'POST')).toBe(false);
   });
 
+  it.each(['wb', 'qd', 'trae'] as const)('OAuth：%s 引擎显示授权页签', (engine) => {
+    mockFetch(() => json({}));
+    renderDialog(engine);
+    expect(screen.getAllByRole('tab').some((t) => /OAuth/.test(t.textContent || ''))).toBe(true);
+  });
+
   it('OAuth：开始授权后展示授权链接并轮询 poll', async () => {
     mockFetch((url) => {
       if (url.includes('/login/start')) return json({ state: 'st-1', authUrl: 'https://example.test/auth?state=st-1' });
       if (url.includes('/login/poll')) return json({ status: 'pending' });
       return json({});
     });
-    renderDialog();
+    renderDialog('trae');
 
     const tab = screen.getAllByRole('tab').find((t) => /OAuth/.test(t.textContent || ''))!;
     await user().click(tab);

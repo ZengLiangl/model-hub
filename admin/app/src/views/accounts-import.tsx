@@ -135,15 +135,13 @@ export function ImportDialog(props: { open: boolean; onClose: () => void; engine
 
   const busy = importJson.isPending || scan.isPending || importDesk.isPending || usePat.isPending;
 
-  // Trae 没有设备授权流程（引擎 start_login 固定返回 unsupported），
-  // 不给 OAuth 页签，免得点进去只看到一条报错。
-  const allTabs: { id: 'json' | 'pat' | 'desktop' | 'oauth'; icon: typeof FileJson; label: string }[] = [
+  // 三个引擎都支持浏览器授权：wb/qd 走 PKCE 设备授权，trae 走 loopback 回调。
+  const tabs: { id: 'json' | 'pat' | 'desktop' | 'oauth'; icon: typeof FileJson; label: string }[] = [
     { id: 'json', icon: FileJson, label: t('accounts.import.json') },
     { id: 'pat', icon: KeyRound, label: t('accounts.import.pat') },
     { id: 'desktop', icon: MonitorDown, label: t('accounts.import.desktop') },
     { id: 'oauth', icon: ShieldCheck, label: t('accounts.import.oauth') },
   ];
-  const tabs = allTabs.filter(function (item) { return item.id !== 'oauth' || props.engine !== 'trae'; });
 
   return (
     <Dialog open={props.open} onOpenChange={function (v) { if (!v) closeAll(); }}>
