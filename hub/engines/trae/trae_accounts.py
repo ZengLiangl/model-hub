@@ -18,12 +18,16 @@
   3. 只用标准库。
 """
 
+import base64
 import contextlib
 import datetime
 import hashlib
+import html
+import http.server
 import ipaddress
 import json
 import os
+import platform
 import re
 import socket
 import threading
@@ -31,6 +35,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 # ---------------------------------------------------------------------------
 # 双区出口表（.team/PROTOCOL.md 第一节）
@@ -72,6 +77,161 @@ CLIENT_UA = "trae2api-hub/1.0"
 # ExchangeToken（.team/PROTOCOL.md 第五节）：仅兜底路径使用
 LOGIN_CLIENT_ID = "ono9krqynydwx5"
 PATH_EXCHANGE_TOKEN = "/cloudide/api/v3/trae/oauth/ExchangeToken"
+
+# ---------------------------------------------------------------------------
+# 浏览器授权登录（loopback + PKCE）——与官方客户端的登录流程一致
+#   1. 本机 127.0.0.1:<随机端口> 起回调服务
+#   2. 打开 {login_host}/authorization?...&auth_callback_url=http://127.0.0.1:<port>/authorize
+#   3. 浏览器登录后回跳，带 authCodeInfo（JSON，含 AuthCode）
+#   4. POST {api_host}/trae/api/v3/oauth/ExchangeToken 换 Token / RefreshToken
+#      （此步不需要 DeviceProof 签名；只有 refreshToken 续期才需要）
+# ---------------------------------------------------------------------------
+OAUTH_REALMS = {
+    "cn": {
+        "login_host": "https://www.trae.cn",
+        "api_host": "https://api.trae.cn",
+        # 官方客户端 CN 回退值（main.js 的 Ny()）
+        "client_id": "ono9krqynydwx5",
+    },
+    "intl": {
+        "login_host": "https://www.trae.ai",
+        "api_host": "https://api.trae.ai",
+        # 两区共用 IDE 的 client id（en1oxy7wnw8j9n 是 SOLO 应用变体，不是 IDE）
+        "client_id": "ono9krqynydwx5",
+    },
+}
+OAUTH_CALLBACK_PATH = "/authorize"
+OAUTH_EXCHANGE_PATH = "/trae/api/v3/oauth/ExchangeToken"
+OAUTH_USERINFO_PATH = "/cloudide/api/v3/trae/GetUserInfo"
+OAUTH_SESSION_TTL = 300          # 授权窗口 5 分钟
+OAUTH_HTTP_TIMEOUT = 30
+
+_OAUTH_SESSIONS = {}
+_OAUTH_LOCK = threading.Lock()
+
+
+def _b64url(raw):
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _pkce_pair():
+    """生成 PKCE code_verifier / code_challenge（S256，与客户端一致）。"""
+    verifier = _b64url(os.urandom(48))
+    challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+    return verifier, challenge
+
+
+def _der_tlv(tag, payload):
+    size = len(payload)
+    if size < 0x80:
+        head = bytes([size])
+    else:
+        raw = size.to_bytes((size.bit_length() + 7) // 8, "big")
+        head = bytes([0x80 | len(raw)]) + raw
+    return bytes([tag]) + head + payload
+
+
+def _der_int(value):
+    raw = int(value).to_bytes(max(1, (int(value).bit_length() + 7) // 8), "big")
+    if raw[0] & 0x80:
+        raw = b"\x00" + raw
+    return _der_tlv(0x02, raw)
+
+
+def _der_oid(dotted):
+    parts = [int(p) for p in dotted.split(".")]
+    body = bytes([parts[0] * 40 + parts[1]])
+    for part in parts[2:]:
+        chunk = [part & 0x7F]
+        part >>= 7
+        while part:
+            chunk.append(0x80 | (part & 0x7F))
+            part >>= 7
+        body += bytes(reversed(chunk))
+    return _der_tlv(0x06, body)
+
+
+def _pem_wrap(label, der):
+    body = base64.b64encode(der).decode("ascii")
+    lines = [body[i:i + 64] for i in range(0, len(body), 64)]
+    return "-----BEGIN %s-----\n%s\n-----END %s-----\n" % (
+        label, "\n".join(lines), label)
+
+
+def _generate_device_keypair():
+    """生成 P-256 密钥对（SEC1 私钥 PEM + SPKI 公钥 PEM）。
+
+    与官方客户端一致：登录时把公钥塞进 DeviceInfo.DevicePublicKey，私钥留给
+    INTL 的 refreshToken 续期做 DeviceProof 签名。纯 Python，不依赖 cryptography。
+    失败返回 ("", "")，登录仍可继续（AuthCode 换 Token 不校验签名）。
+    """
+    try:
+        import trae_client as tc
+        order = tc.P256_N
+        scalar = int.from_bytes(os.urandom(32), "big") % (order - 1) + 1
+        point = tc._ec_mul(scalar)
+        x, y = point
+        size = 32
+        pub = b"\x04" + x.to_bytes(size, "big") + y.to_bytes(size, "big")
+        priv_der = _der_tlv(0x30, b"".join([
+            _der_int(1),
+            _der_tlv(0x04, scalar.to_bytes(size, "big")),
+            _der_tlv(0xA0, _der_oid("1.2.840.10045.3.1.7")),
+            _der_tlv(0xA1, _der_tlv(0x03, b"\x00" + pub)),
+        ]))
+        alg = _der_tlv(0x30, _der_oid("1.2.840.10045.2.1")
+                       + _der_oid("1.2.840.10045.3.1.7"))
+        pub_der = _der_tlv(0x30, alg + _der_tlv(0x03, b"\x00" + pub))
+        return _pem_wrap("EC PRIVATE KEY", priv_der), _pem_wrap("PUBLIC KEY", pub_der)
+    except Exception:
+        return "", ""
+
+
+def _oauth_ide_version(realm):
+    ua = REALMS.get(realm, {}).get("ua") or ""
+    return ua.rsplit("/", 1)[-1] or "3.4.3"
+
+
+def _oauth_device_id(seed, realm=None):
+    """device_id：CN 为 16 位数字（0.2.16 起），INTL 为 19 位。"""
+    digest = int(hashlib.sha256(("trae-device:%s" % seed).encode("utf-8")).hexdigest()[:16], 16)
+    if str(realm or "").lower() == "cn":
+        return str(10 ** 15 + digest % (9 * 10 ** 15))
+    return str(10 ** 18 + digest % (9 * 10 ** 18))
+
+
+def _oauth_machine_id(seed):
+    return hashlib.sha256(("trae-machine:%s" % seed).encode("utf-8")).hexdigest()
+
+
+def _oauth_http_json(url, payload, token="", timeout=OAUTH_HTTP_TIMEOUT):
+    """POST JSON 到 Trae 上游，返回 (Result dict, 原始响应)。"""
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "x-cloudide-token": token or "",
+        "User-Agent": CLIENT_UA,
+        "X-Request-Id": uuid.uuid4().hex,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:400]
+        except Exception:
+            pass
+        raise AccountError("Trae 上游返回 HTTP %d%s" % (
+            exc.code, (": " + detail) if detail else ""), status=exc.code)
+    obj = json.loads(raw or "{}")
+    error = ((obj.get("ResponseMetadata") or {}).get("Error") or {})
+    if error and (error.get("Code") or error.get("Message")):
+        raise AccountError("Trae 上游拒绝：%s %s" % (
+            error.get("Code") or "", error.get("Message") or ""))
+    return (obj.get("Result") or obj.get("result") or obj), raw
+
 
 # 冷却 / 熔断参数（秒）
 COOLDOWN_BASE = 30
@@ -1037,6 +1197,15 @@ class Account(object):
             "user_region": dict(self.user_region),
             "account": dict(self.account),
         })
+        # 浏览器授权登录生成的设备密钥：INTL 的 refreshToken 续期需要它做
+        # DeviceProof 签名；缺失时协议层只能走无签名兜底。
+        extra = self.extra or {}
+        if extra.get("privateKeyPEM"):
+            data["privateKeyPEM"] = extra["privateKeyPEM"]
+        if extra.get("publicKeyPEM"):
+            data["publicKeyPEM"] = extra["publicKeyPEM"]
+        if isinstance(extra.get("deviceInfo"), dict):
+            data["deviceInfo"] = dict(extra["deviceInfo"])
         return RefreshPayload(data)
 
     # -- 出口代理 --------------------------------------------------------
@@ -1763,6 +1932,342 @@ class SessionAffinity(object):
 
 
 # ---------------------------------------------------------------------------
+# 浏览器授权登录：本地回调服务 + PKCE + AuthCode 换 Token
+# ---------------------------------------------------------------------------
+class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
+    """127.0.0.1:<port>/authorize 的一次性回调处理器。"""
+
+    server_version = "TraeHubOAuth/1.0"
+
+    def log_message(self, fmt, *args):      # 不往 stderr 打访问日志
+        pass
+
+    def do_GET(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path != OAUTH_CALLBACK_PATH:
+            self._reply(404, "Not Found", "无效的回调地址。")
+            return
+        params = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+        session = getattr(self.server, "oauth_session", None)
+        if session is None:
+            self._reply(410, "会话已失效", "请回到面板重新发起登录。")
+            return
+        try:
+            session.complete(params)
+            self._reply(200, "授权成功", "已完成登录，请回到面板查看账号。")
+        except Exception as exc:
+            session.fail(exc)
+            self._reply(400, "授权失败", str(exc))
+
+    def _reply(self, code, title, detail=""):
+        body = (
+            "<!doctype html><meta charset='utf-8'>"
+            "<title>%s</title>"
+            "<div style='font-family:system-ui,-apple-system,sans-serif;"
+            "padding:56px 24px;text-align:center;color:#1f2328'>"
+            "<h2 style='margin:0 0 12px'>%s</h2>"
+            "<p style='color:#57606a'>%s</p></div>"
+        ) % (html.escape(title), html.escape(title), html.escape(detail))
+        raw = body.encode("utf-8")
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        except Exception:
+            pass
+
+
+class _OAuthLoginSession(object):
+    """一次浏览器授权会话（状态机：pending -> exchanging -> ok/error/expired）。"""
+
+    def __init__(self, pool, realm, platform=None):
+        self.pool = pool
+        self.realm = realm
+        self.platform = platform or "CLI"
+        self.state = uuid.uuid4().hex
+        self.verifier, self.challenge = _pkce_pair()
+        self.created_at = _now()
+        self.status = "pending"
+        self.message = "等待浏览器授权…"
+        self.error = ""
+        self.account_view = None
+        self.auth_url = ""
+        self.server = None
+        self.thread = None
+        self.timer = None
+        seed = "oauth-%s" % self.state[:12]
+        self.device_id = _oauth_device_id(seed, realm)
+        self.machine_id = _oauth_machine_id(seed)
+        self.private_pem, self.public_pem = _generate_device_keypair()
+        self.ide_version = _oauth_ide_version(realm)
+
+    # -- 生命周期 --------------------------------------------------------
+    def prepare(self):
+        self.server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _OAuthCallbackHandler)
+        self.server.daemon_threads = True
+        self.server.oauth_session = self
+        port = self.server.server_address[1]
+        cfg = OAUTH_REALMS[self.realm]
+        params = {
+            "login_version": "1",
+            "auth_from": "trae",
+            "login_channel": "native_ide",
+            "plugin_version": self.ide_version,
+            "auth_type": "local",
+            "client_id": cfg["client_id"],
+            "redirect": "0",
+            "login_trace_id": self.state,
+            "auth_callback_url": "http://127.0.0.1:%d%s" % (port, OAUTH_CALLBACK_PATH),
+            "machine_id": self.machine_id,
+            "device_id": self.device_id,
+            "code_challenge": self.challenge,
+            "code_challenge_method": "S256",
+            # 以下 x_* 与官方客户端 buildLoginUrl 的 query 片段逐项一致
+            "x_device_id": self.device_id,
+            "x_machine_id": self.machine_id,
+            "x_device_brand": platform.machine(),
+            "x_device_type": platform.system(),
+            "x_os_version": platform.release(),
+            "x_app_version": self.ide_version,
+            "x_app_type": "stable",
+        }
+        self.auth_url = "%s/authorization?%s" % (
+            cfg["login_host"], urllib.parse.urlencode(params))
+
+    def serve(self):
+        self.thread = threading.Thread(
+            target=self._serve_forever,
+            name="trae-oauth-%s" % self.state[:8], daemon=True)
+        self.thread.start()
+        self.timer = threading.Timer(OAUTH_SESSION_TTL, self.expire_if_pending)
+        self.timer.daemon = True
+        self.timer.start()
+
+    def _serve_forever(self):
+        try:
+            self.server.serve_forever(poll_interval=0.2)
+        except Exception:
+            pass
+
+    def expired(self):
+        return _now() - self.created_at > OAUTH_SESSION_TTL
+
+    def expire_if_pending(self):
+        if self.status in ("pending", "exchanging"):
+            self.status = "expired"
+            self.message = "授权超时（5 分钟），请重新发起登录"
+        self.close()
+
+    def close(self):
+        timer, self.timer = self.timer, None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        server, self.server = self.server, None
+        if server is not None:
+            # shutdown() 只在 serve_forever 已运行时才会返回；未启动时调用会永久阻塞
+            thread = self.thread
+            if thread is not None and thread.is_alive():
+                try:
+                    server.shutdown()
+                except Exception:
+                    pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+        with _OAUTH_LOCK:
+            _OAUTH_SESSIONS.pop(self.state, None)
+
+    def fail(self, exc):
+        if self.status == "ok":
+            return
+        self.error = _scrub_secrets(str(exc or "登录失败"))[:300]
+        self.status = "error"
+        self.message = self.error
+
+    # -- 回调处理 --------------------------------------------------------
+    def complete(self, params):
+        if self.status == "ok":
+            return
+        if self.status in ("expired", "cancelled"):
+            raise RuntimeError("登录会话已失效，请重新发起")
+        err = (params.get("error") or params.get("error_code")
+               or params.get("errCode"))
+        if err:
+            raise RuntimeError(params.get("error_msg") or params.get("errorMsg")
+                               or ("授权被拒绝：%s" % err))
+        auth_code = self._auth_code(params)
+        if not auth_code:
+            raise RuntimeError("回调里没有 authCode（授权可能被取消）")
+        self.status = "exchanging"
+        self.message = "正在用授权码换取 Token…"
+        exchanged = self._exchange(auth_code)
+        user_info = self._user_info(params, exchanged)
+        account = self._build_account(exchanged, user_info)
+        self.pool.add(account)
+        try:
+            self.account_view = dict(account.public(), nickname=account.nickname)
+        except Exception:
+            self.account_view = account.public()
+        self.status = "ok"
+        self.message = "登录成功"
+        self.pool.log("oauth 登录成功：%s（%s）"
+                      % (mask_uid(account.uid), self.realm))
+
+    @staticmethod
+    def _auth_code(params):
+        raw = str(params.get("authCodeInfo") or "").strip()
+        if raw:
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                obj = None
+            if isinstance(obj, dict):
+                for key in ("AuthCode", "authCode", "auth_code", "code"):
+                    value = str(obj.get(key) or "").strip()
+                    if value:
+                        return value
+            elif not raw.startswith("{"):
+                return raw
+        for key in ("authCode", "auth_code", "code"):
+            value = str(params.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _hosts(self):
+        cfg = OAUTH_REALMS[self.realm]
+        hosts = [cfg["api_host"]]
+        fallback = (REALMS.get(self.realm) or {}).get("account")
+        if fallback and fallback not in hosts:
+            hosts.append(fallback)
+        return hosts
+
+    def _exchange(self, auth_code):
+        body = {
+            "ClientID": OAUTH_REALMS[self.realm]["client_id"],
+            "AuthCode": auth_code,
+            "CodeVerifier": self.verifier,
+            "DeviceInfo": self._device_info(),
+            "IDEVersion": self.ide_version,
+        }
+        last_error = None
+        for host in self._hosts():
+            try:
+                result, _ = _oauth_http_json(host + OAUTH_EXCHANGE_PATH, body)
+                if not str((result or {}).get("Token") or ""):
+                    raise AccountError("ExchangeToken 未返回 Token")
+                return result
+            except AccountError as exc:
+                last_error = exc
+                if getattr(exc, "status", None) in (400, 401, 403):
+                    break        # 授权码/客户端被拒：换主机也没用
+            except urllib.error.URLError as exc:
+                last_error = AccountError("无法连接 %s：%s" % (host, exc.reason))
+        raise last_error or AccountError("ExchangeToken 失败")
+
+    def _device_info(self):
+        # 字段与官方客户端 exchangeTokenByAuthCode 的 DeviceInfo 一致
+        system = platform.system()
+        return {
+            "DeviceID": self.device_id,
+            "MachineID": self.machine_id,
+            "PlatformCode": "IDE_PC",
+            "DeviceType": "PC",
+            "DeviceName": platform.node() or system,
+            "DeviceModel": platform.machine() or "PC",
+            "ClientVersion": self.ide_version,
+            "DevicePublicKey": self.public_pem,
+            "DeviceBrand": "Apple" if system == "Darwin" else system,
+            "DeviceCPU": platform.machine(),
+            "OSInfo": system,
+            "OSVersion": platform.release(),
+        }
+
+    def _user_info(self, params, exchanged):
+        raw = str(params.get("userInfo") or "").strip()
+        if raw:
+            try:
+                obj = json.loads(raw)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+        token = str((exchanged or {}).get("Token") or "")
+        body = {"ReqSource": "IDE", "IDEVersion": self.ide_version}
+        for host in self._hosts():
+            try:
+                result, _ = _oauth_http_json(host + OAUTH_USERINFO_PATH, body,
+                                             token=token)
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                continue
+        return {}
+
+    def _build_account(self, exchanged, user_info):
+        exchanged = exchanged or {}
+        user_info = user_info or {}
+        token = str(exchanged.get("Token") or "")
+        refresh = str(exchanged.get("RefreshToken") or "")
+        if not token or not refresh:
+            raise AccountError("ExchangeToken 未返回完整凭证（Token/RefreshToken）")
+        uid = str(user_info.get("UserID") or user_info.get("UserId")
+                  or exchanged.get("UserID") or exchanged.get("UserId") or "").strip()
+        if not uid:
+            uid = "oauth" + hashlib.sha256(refresh.encode("utf-8")).hexdigest()[:15]
+        cfg = REALMS[self.realm]
+        region = str(user_info.get("AIRegion") or cfg["region"])
+        now = _now()
+        expired_at = normalize_epoch(exchanged.get("TokenExpireAt"))
+        if not expired_at:
+            try:
+                duration = int(float(exchanged.get("TokenExpireDuration") or 0))
+            except (TypeError, ValueError):
+                duration = 0
+            expired_at = now + (duration if duration > 0 else 3600)
+        refresh_expired_at = normalize_epoch(exchanged.get("RefreshExpireAt"))
+        system = platform.system()
+        return Account({
+            "uid": uid,
+            "realm": self.realm,
+            "token": token,
+            "refresh_token": refresh,
+            "expired_at": expired_at,
+            "refresh_expired_at": refresh_expired_at,
+            "host": OAUTH_REALMS[self.realm]["api_host"],
+            "user_region": {"region": region, "_aiRegion": region},
+            "account": {
+                "username": user_info.get("ScreenName") or user_info.get("UserName") or "",
+                "email": (user_info.get("NonPlainTextEmail")
+                          or user_info.get("Email") or ""),
+                "avatar_url": user_info.get("AvatarUrl") or "",
+                "userType": user_info.get("UserType"),
+            },
+            "enabled": True,
+            "source": "oauth",
+            "extra": {
+                "refreshTokenOrigin": "oauth",
+                "privateKeyPEM": self.private_pem,
+                "publicKeyPEM": self.public_pem,
+                "deviceInfo": {
+                    "DeviceId": self.device_id,
+                    "MachineId": self.machine_id,
+                    "DeviceType": "macos" if system == "Darwin" else "windows",
+                    "OsVersion": platform.release(),
+                    "DeviceBrand": "Apple" if system == "Darwin" else system,
+                },
+            },
+        }, directory=self.pool.dir)
+
+
+# ---------------------------------------------------------------------------
 # AccountPool
 # ---------------------------------------------------------------------------
 def _default_log(message, level=None):
@@ -2341,17 +2846,63 @@ class AccountPool(object):
                  % (mask_uid(account.uid), account.realm))
         return dict(account.public(), uidSynthetic=bool(derived_uid), created=True)
 
-    # -- 旧登录路由的明确回答（Trae 没有设备授权流程）--------------------
+    # -- 浏览器授权登录（loopback + PKCE，与官方客户端同款流程）----------
     def start_login(self, realm=None, platform=None):
-        return {"status": "unsupported", "realm": realm_key(realm) or "",
-                "message": "Trae 没有设备授权流程：请用 Desktop 导入，或粘贴 refreshToken"}
+        realm = realm_key(realm) or DEFAULT_REALM
+        if realm not in OAUTH_REALMS:
+            return {"status": "error", "realm": realm,
+                    "message": "不支持的区域：%s" % realm}
+        session = _OAuthLoginSession(self, realm, platform=platform)
+        try:
+            session.prepare()
+        except Exception as exc:
+            return {"status": "error", "realm": realm,
+                    "message": "无法启动本地回调服务：%s"
+                               % _scrub_secrets(str(exc))}
+        with _OAUTH_LOCK:
+            _OAUTH_SESSIONS[session.state] = session
+        session.serve()
+        self.log("oauth 登录会话已创建（realm=%s, port=%d）"
+                 % (realm, session.server.server_address[1]))
+        return {"status": "pending", "state": session.state, "realm": realm,
+                "authUrl": session.auth_url, "expiresIn": OAUTH_SESSION_TTL}
 
     def poll_login(self, state=None):
-        return {"status": "unsupported",
-                "message": "Trae 没有设备授权流程：请用 Desktop 导入，或粘贴 refreshToken"}
+        state = str(state or "").strip()
+        with _OAUTH_LOCK:
+            session = _OAUTH_SESSIONS.get(state)
+        if session is None:
+            return {"status": "unknown", "message": "登录会话不存在或已结束"}
+        if session.status == "ok":
+            result = {"status": "ok", "state": state, "message": "登录成功",
+                      "account": session.account_view}
+            session.close()
+            return result
+        if session.status == "error":
+            result = {"status": "error", "state": state,
+                      "message": session.error or session.message}
+            session.close()
+            return result
+        if session.status == "cancelled":
+            session.close()
+            return {"status": "cancelled", "state": state, "message": "已取消登录"}
+        if session.status == "expired" or session.expired():
+            session.status = "expired"
+            session.close()
+            return {"status": "expired", "state": state,
+                    "message": "授权超时（5 分钟），请重新发起登录"}
+        return {"status": "pending", "state": state,
+                "message": session.message or "等待浏览器授权…"}
 
     def cancel_login(self, state=None):
-        return False
+        state = str(state or "").strip()
+        with _OAUTH_LOCK:
+            session = _OAUTH_SESSIONS.pop(state, None)
+        if session is None:
+            return False
+        session.status = "cancelled"
+        session.close()
+        return True
 
     # -- PAT 导入（Trae 的 PAT 就是 refreshToken）-------------------------
     def import_pat(self, pat, realm=None, name=None, client=None):

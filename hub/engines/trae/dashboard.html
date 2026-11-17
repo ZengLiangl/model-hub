@@ -4346,7 +4346,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
 <div class="modal-mask" id="loginModal">
   <div class="modal" role="dialog" aria-modal="true">
     <div class="modal-hd">
-      <h2>添加 Trae 账号 (OAuth 设备授权)</h2>
+      <h2>添加 Trae 账号 (浏览器授权)</h2>
       <button class="modal-x" onclick="closeLogin()" aria-label="关闭">×</button>
     </div>
     <div class="modal-bd">
@@ -4908,7 +4908,7 @@ async function triggerLoginForSelectedRealm(){
   if(s3) s3.className = "step";
 
   const s1Text = document.getElementById("step1Text");
-  if(s1Text) s1Text.textContent = isCn ? "正在向 trae.com.cn (国内版) 申请设备授权..." : "正在向 trae.ai (国际版) 申请设备授权...";
+  if(s1Text) s1Text.textContent = isCn ? "正在准备国内版 (trae.com.cn) 浏览器授权链接..." : "正在准备国际版 (trae.ai) 浏览器授权链接...";
 
   try{
     const r = await postJSON("/accounts/login/start", {platform: "CLI", realm: realm});
