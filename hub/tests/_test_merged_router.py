@@ -195,6 +195,66 @@ _bad2 = _Unfiltered.merged_model_list(
 H.check("R31 阳性对照：不过滤时 wb 的国际区模型会漏出来",
         any(d["id"] == "kimi-k3.1-pro-highspeed" for d in _bad2), _bad2)
 
+# ---- 路由口径与清单口径对齐（第 247 轮）----
+# 由来：订单链是 wb cn 502 → trae cn 502 → wb intl 503。wb 只有国内区的号，
+# 链尾那一跳 (wb, intl) 必然 503「该区域没有任何账号」，于是客户端看到的是
+# 「去面板加个国际区的号」，真实原因（前面的上游 502）被整段盖掉。
+s = SnapAcct({"wb": {"cn": {"m"}, "intl": {"m", "intl-only"}},
+              "qd": {"cn": {"m"}, "intl": set()}},
+             {"wb": 3, "qd": 1},
+             {"wb": 1, "qd": 1}, {"wb": {"cn": 1}})
+H.eq("R32 只有国内区号 -> (wb,intl) 不进候选链",
+     router.candidates_for("m", s, CFG_CN_AUTO), [("wb", "cn"), ("qd", "cn")])
+H.eq("R32b 只挂在没号那一区的模型：不筛就无路可走 -> 退回原链（仍试一次，不返回空）",
+     router.candidates_for("intl-only", s, CFG_CN_AUTO), [("wb", "intl")])
+
+s = SnapAcct({"wb": {"cn": {"m"}}, "trae": {"cn": {"m"}}},
+             {"wb": 1, "trae": 9}, {"wb": 1, "trae": 0})
+H.eq("R33 0 个号的引擎不进候选链（清单不发它，路由也不拿它试）",
+     router.candidates_for("m", s, CFG_CN_AUTO), [("wb", "cn")])
+
+s = SnapAcct({"wb": {"cn": {"m"}}}, {"wb": 1}, {"wb": 0, "qd": 0, "trae": 0})
+H.eq("R34 三家都没号 -> 候选链退回不筛的版本（不是空链）",
+     router.candidates_for("m", s, CFG_CN_AUTO), [("wb", "cn")])
+
+H.eq("R35 realm_has_accounts：未知=True / 该区 0=False / 该区有号=True",
+     (router.realm_has_accounts(snap({}, {}), "wb", "intl"),
+      router.realm_has_accounts(SnapAcct({}, {}, {"wb": 1}, {"wb": {"cn": 1}}), "wb", "intl"),
+      router.realm_has_accounts(SnapAcct({}, {}, {"wb": 1}, {"wb": {"cn": 1}}), "wb", "cn")),
+     (True, False, True))
+
+# 清单外的模型（拼错的模型名 / 新模型）：兜底链也不能瞎子摸象到没号的区
+s = SnapAcct({}, {}, {"wb": 1}, {"wb": {"cn": 1}})
+H.eq("R36 清单外模型：兜底链按账号挑区（wb 无国际区号 -> 只给 cn）",
+     router.fallback_candidates(s, CFG_CN_AUTO, "wb"), [("wb", "cn")])
+H.eq("R36b 账号表不知道 -> 退回 (engine, None)，老行为不变",
+     router.fallback_candidates(snap({}, {}), CFG_CN_AUTO, "wb"), [("wb", None)])
+H.eq("R36c 账号表说哪个区都没号 -> 也退回 (engine, None)",
+     router.fallback_candidates(SnapAcct({}, {}, {"wb": 1}, {"wb": {"": 1}}),
+                                CFG_CN_AUTO, "wb"), [("wb", None)])
+
+
+class _UnfilteredCandidates(object):
+    """阳性对照：老实现（不按账号筛）。必须能证明 R32 的绿不是判据写空。"""
+    @staticmethod
+    def candidates_for(model, snapshot, config):
+        first = config["prefer_realm"]
+        out = []
+        for realm in [first] + [r for r in router.REALMS if r != first]:
+            for engine in [e for e in router.ENGINES
+                           if router.engine_holds(snapshot, e, realm, model)]:
+                out.append((engine, realm))
+        return out
+
+
+_s_ctrl = SnapAcct({"wb": {"cn": {"m"}, "intl": {"m"}}}, {}, {"wb": 1}, {"wb": {"cn": 1}})
+H.check("R37 阳性对照：不按账号筛时 (wb,intl) 就在链里（R32 的判据不是空的）",
+        ("wb", "intl") in _UnfilteredCandidates.candidates_for("m", _s_ctrl, CFG_CN_AUTO),
+        _UnfilteredCandidates.candidates_for("m", _s_ctrl, CFG_CN_AUTO))
+H.check("R38 同一份快照走真实现：链里没有 (wb,intl)",
+        ("wb", "intl") not in router.candidates_for("m", _s_ctrl, CFG_CN_AUTO),
+        router.candidates_for("m", _s_ctrl, CFG_CN_AUTO))
+
 # ---------- 三协议 model 提取 ----------
 for label, doc in (("chat", {"model": "glm-5.3-flash", "messages": []}),
                    ("responses", {"model": "glm-5.3-flash", "stream": True}),

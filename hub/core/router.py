@@ -57,6 +57,10 @@ class RouteSnapshot(object):
         self.ready = {}
         self.accounts = {}
         self.accounts_by_realm = {}
+        #: 引擎当前的出口（/health 的 realm）—— 「客户端没钉区时它会用哪个区」。
+        #: 面板上的区开关与号的实际归属经常对不上（实测 wb 开关 intl、号在 cn），
+        #: 于是任何不带 realm 的请求都会撞上「该区域没有任何账号」。
+        self.current_realm = {}
         self.errors = {}
 
     def is_fresh(self):
@@ -111,12 +115,14 @@ def refresh_snapshot(ports, key, snapshot, force=False):
     if not force and snapshot.is_fresh():
         return snapshot
     models, ready, accounts, by_realm, errors = {}, {}, {}, {}, {}
+    current = {}
     for engine in ENGINES:
         port = (ports or {}).get(engine)
         if not port:
             continue
         models[engine], ready[engine], accounts[engine] = {}, None, None
         by_realm[engine], errors[engine] = None, None
+        current[engine] = None
         status, body = _http(port, "/health")
         if status == 200:
             try:
@@ -134,6 +140,8 @@ def refresh_snapshot(ports, key, snapshot, force=False):
                 #   「有号，但**没有国际区**的号」—— 于是 wb intl 独有模型
                 #   （实测 kimi-k3.1-pro-highspeed）不该出现在清单里。
                 by_realm[engine] = _realm_counts(doc.get("accounts_by_realm"))
+                _cur = str(doc.get("realm") or "").strip().lower()
+                current[engine] = _cur if _cur in REALMS else None
             else:
                 errors[engine] = "health parse error"
         else:
@@ -159,6 +167,7 @@ def refresh_snapshot(ports, key, snapshot, force=False):
         snapshot.ready = ready
         snapshot.accounts = accounts
         snapshot.accounts_by_realm = by_realm
+        snapshot.current_realm = current
         snapshot.errors = errors
         snapshot.at = time.time()
     return snapshot
@@ -197,6 +206,25 @@ def engine_has_accounts(snapshot, engine):
 def engine_accounts_by_realm(snapshot, engine):
     """该引擎按区的账号数 {realm: n}；None = 这家没报这个字段（只有 wb 报）。"""
     return (getattr(snapshot, "accounts_by_realm", None) or {}).get(engine)
+
+
+def realm_has_accounts(snapshot, engine, realm):
+    """(引擎, 区) 这一对**确知**有号？不知道就按有处理。
+
+    与 publishing_realms 同一套取舍：只摘「确知没号」的，不猜。
+
+    路由为什么要用它：wb 只有国内区的号，但它的 intl 目录里照样有这份模型清单，
+    于是 candidates_for 会把 (wb, intl) 排进链尾。那一跳必然 503「该区域没有
+    任何账号」，而且**最后一跳的报错会顶掉前面真实的上游错误** —— 实测
+    deepseek-v4.1-flash 的链是 wb cn 502 → trae cn 502 → wb intl 503，
+    客户端看到的却是「去面板加个国际区的号」。
+    """
+    if not engine_has_accounts(snapshot, engine):
+        return False
+    by_realm = engine_accounts_by_realm(snapshot, engine)
+    if isinstance(by_realm, dict):
+        return (by_realm.get(realm) or 0) > 0
+    return True
 
 
 def publishing_realms(snapshot):
@@ -245,6 +273,10 @@ def candidates_for(model, snapshot, config, requested=None):
     requested：客户端**显式钉**的区域（?realm= / X-Realm）。钉了就把它当本次首选区，
     另一区仍然留在链尾兜底 —— 「显式优先，但不把路走死」。没钉就用 config 的
     prefer_realm。
+
+    ★ 清单口径（publishing_realms）与路由口径在这一层对齐：**确知没号的
+      (引擎, 区)** 不进候选（见 realm_has_accounts）。清单发出去的每一条，
+      候选链里至少有一跳真的能服务；反过来，摘掉的组合也不再被路由拿去试。
     """
     model = str(model or "").strip().lower()
     if not model:
@@ -260,7 +292,7 @@ def candidates_for(model, snapshot, config, requested=None):
         if first not in REALMS:
             first = "cn"
     realms = [first] + [r for r in REALMS if r != first]
-    out = []
+    out, all_hops = [], []
     for realm in realms:
         holders = [e for e in ENGINES if engine_holds(snapshot, e, realm, model)]
         if engine_prefer == "auto":
@@ -269,8 +301,75 @@ def candidates_for(model, snapshot, config, requested=None):
         else:
             holders.sort(key=lambda e: 0 if e == engine_prefer else 1)
         for engine in holders:
-            out.append((engine, realm))
-    return out
+            all_hops.append((engine, realm))
+            # ★ 只留「这一对确知有号」的跳（第 247 轮）：没号的那一跳必然 503，
+            #   白等一次往返，还会把它的"该区域没有任何账号"顶成客户端看到的错误。
+            if realm_has_accounts(snapshot, engine, realm):
+                out.append((engine, realm))
+    # 护栏：全被摘光时（三家都没号 / 按区表整个对不上）退回不筛的链 ——
+    # 与 publishing_realms 第 4 条同口径：不知道、或确实一处都没有时别删路，
+    # 让引擎自己给真实回包（首次运行的 F07 就靠这条不红）。
+    return out or all_hops
+
+
+def engine_current_realm(snapshot, engine):
+    """引擎当前的出口（/health.realm）；没报 / 形状不对 → None（不知道）。"""
+    return (getattr(snapshot, "current_realm", None) or {}).get(engine)
+
+
+def realm_for_unpinned(snapshot, engine, config=None):
+    """客户端**没钉区**时，要不要替它钉一个区？返回区名或 None（不干预）。
+
+    由来（线上实测）：wb 的区开关停在 intl，而唯一的号在 cn —— 于是任何不带
+    realm 的请求都由引擎按自己的默认区（intl）处理，**4ms 就回 503**
+    「no usable account for realm 'intl'；该区域没有任何账号」。用户看到的是让
+    他去面板加号，而真正要做的只是把请求发到 cn。
+
+    只在「确知当前出口没号、且另一个区有号」时改道：
+      · 引擎没报按区账号数（qd/trae）或没报 realm → None，什么都不动；
+      · 当前出口有号 → None（尊重运营者选的出口）；
+      · 当前出口 0 个号、另一个区有号 → 返回那个区（prefer_realm 优先）。
+    """
+    current = engine_current_realm(snapshot, engine)
+    if not current:
+        return None
+    by_realm = engine_accounts_by_realm(snapshot, engine)
+    if not isinstance(by_realm, dict):
+        return None
+    if (by_realm.get(current) or 0) > 0:
+        return None
+    first = str((config or {}).get("prefer_realm") or "cn").strip().lower()
+    if first not in REALMS:
+        first = "cn"
+    for realm in [first] + [r for r in REALMS if r != first]:
+        if (by_realm.get(realm) or 0) > 0:
+            return realm
+    return None
+
+
+def fallback_candidates(snapshot, config, engine):
+    """快照里没有这个模型时的兜底链：默认引擎 × **有号的那些区**。
+
+    老实现给的是 (engine, None)：让引擎用它自己的默认区。而引擎的默认区是面板上
+    那个开关 —— wb 有国内区的号、开关却停在 intl，于是**清单外的任何模型名**
+    都回一句 "no usable account for realm 'intl'；该区域没有任何账号"。真实原因
+    往往只是模型名写错（实测客户端拼出 deepseek-v4.1-flashdeepseek-v4.1-flash），
+    用户却被引去面板加号。
+
+    这里仍然只用默认引擎（不拿别的引擎去猜模型名），但区按 /health 的**按区
+    账号表**挑：表里没有号的区不送（实测 wb 报 accounts_by_realm={'cn':1}，
+    于是 intl 不再被送到一个注定 503 的出口上）。引擎没报按区表（qd/trae）、
+    或表里哪个区都没号时，退回 (engine, None) —— 让引擎自己定，老行为不变。
+    """
+    first = str((config or {}).get("prefer_realm") or "cn").strip().lower()
+    if first not in REALMS:
+        first = "cn"
+    by_realm = engine_accounts_by_realm(snapshot, engine)
+    if not isinstance(by_realm, dict):
+        return [(engine, None)]
+    realms = [first] + [r for r in REALMS if r != first]
+    out = [(engine, r) for r in realms if (by_realm.get(r) or 0) > 0]
+    return out or [(engine, None)]
 
 
 def merged_model_list(snapshot):

@@ -1288,9 +1288,12 @@ class PortalHandler(BaseHTTPRequestHandler):
                     }
                 })
         if not candidates:
-            # 快照里没有这个模型（新模型/清单未取全）：退回默认引擎、区域让引擎
-            # 自己定（引擎内的自动路由仍会兜底），至少别比旧行为差。
-            candidates = [(self.server.default_engine, None)]
+            # 快照里没有这个模型（新模型/清单未取全）：退回默认引擎，但**区按账号挑**
+            # —— 老实现给 (engine, None) 让引擎用自己的默认区，wb 的默认区停在
+            # intl 而没有国际区账号时，任何清单外模型名都会回「该区域没有任何账号」
+            # （见 router.fallback_candidates 的说明）。
+            candidates = router.fallback_candidates(
+                snapshot, cfg, self.server.default_engine)
         # ★ realm 由 hub **权威覆盖**（每个候选带自己的 ?realm=）：
         #   ① 客户端的 realm 参数必须剥掉 —— 否则拼出 realm=intl&realm=cn，
         #      引擎取第一个值，hub 的 X-Hub-Route 头就和实际行为对不上（假合并）；
@@ -1300,6 +1303,8 @@ class PortalHandler(BaseHTTPRequestHandler):
         attempts = []
         last = None
         last_engine = None
+        #: 链里「这一跳确实有号」的最近一次失败 —— 全链失败时用它报错。
+        informative = None
         # ★ 流式：合并 key 也要边收边发。先拿**第一跳**直接透传（遇到可重试
         #   状态就撤回，交给下面的重试循环），这样长回答不会整段憋到最后。
         if method == "POST" and b'"stream"' in body and b'true' in body and candidates:
@@ -1329,8 +1334,19 @@ class PortalHandler(BaseHTTPRequestHandler):
                              "status": status})
             last = (status, payload, pairs)
             last_engine = engine
+            if realm and router.realm_has_accounts(snapshot, engine, realm):
+                informative = (status, payload, pairs, engine, realm)
             if status not in router.RETRYABLE_STATUS:
                 break
+        # ★ 全链失败时报「有号的那一跳」，而不是原样透传最后一跳：最后一跳可能
+        #   恰好是没号的区（wb 的 intl），它的 "no usable account for realm 'intl'"
+        #   会把前面真实的上游错误（wb cn 502）整段盖掉，用户被引去面板加号。
+        #   尝试链本身仍完整写在 X-Hub-Route-Attempts 里，排障不缺信息。
+        reported_hint = ""
+        if last is not None and last[0] >= 400 and informative is not None:
+            last = informative[:3]
+            last_engine = informative[3]
+            reported_hint = informative[4]
         # 真实服务区：引擎回包里的 X-WB-Realm / X-Qoder-Realm 优先（它可能因引擎
         # 自身的 auto-realm 回退而与 hub 请求的区不同）；引擎没报就用 hub 请求的区。
         served_realm = ""
@@ -1338,7 +1354,7 @@ class PortalHandler(BaseHTTPRequestHandler):
             if name.lower() in ("x-wb-realm", "x-qoder-realm") and value:
                 served_realm = value
                 break
-        reported = served_realm or attempts[-1]["realm"] or "auto"
+        reported = served_realm or reported_hint or attempts[-1]["realm"] or "auto"
         self._record_route(last_engine, reported, attempts, last[0], model)
         extra = [("X-Hub-Route", "%s:%s" % (last_engine, reported)),
                  ("X-Hub-Route-Attempts", json.dumps(attempts, ensure_ascii=False))]
@@ -1448,6 +1464,10 @@ class PortalHandler(BaseHTTPRequestHandler):
         # 这样「一把合并 key 调所有」不必再在两个引擎里各登记一遍。
         kind, _entry = keys.classify(self._presented_key())
         upstream = keys.upstream_key(engine) if kind == "merged" else None
+        # ★ 没钉区的推理请求：别让引擎用它那个可能空着的默认出口（见
+        #   router.realm_for_unpinned）。实测 wb 开关在 intl、号在 cn 时，
+        #   /api/wb/v1/chat/completions 4ms 就回「该区域没有任何账号」。
+        query = self._pin_realm_if_dead(engine, upstream_path, query)
         # ★ 流式透传：客户端要 stream 时不要"收完整包再由门户转发" ——
         #   那样一次 28s 的回答在整个生成期间一个字都不下发，客户端很容易
         #   判成连接错误（实测出现过 TRANSPORT）。这里边收边发。
@@ -1457,6 +1477,38 @@ class PortalHandler(BaseHTTPRequestHandler):
         status, payload, pairs = self._proxy_once(
             engine, upstream_path, query, method, body=body, upstream_key=upstream)
         self._relay(status, payload, pairs, engine)
+
+    def _pin_realm_if_dead(self, engine, upstream_path, query):
+        """推理请求没钉区、而引擎当前出口一个号都没有 -> 替它钉一个有号的区。
+
+        只在「确知当前出口 0 个号 + 另一个区有号」时改道（判定在 router 里），
+        其余情况原样返回 query —— 引擎的默认出口、客户端的显式选择都不受影响。
+        """
+        try:
+            path = str(upstream_path or "").strip("/").lower()
+            if path not in router.CHAT_PATHS and path not in ("v1/models", "models"):
+                return query
+            if (self.headers.get("X-Realm") or "").strip():
+                return query
+            if urllib.parse.parse_qs(query or "").get("realm"):
+                return query
+            snapshot = router.refresh_snapshot(
+                self.server.ports,
+                {e: (keys.upstream_key(e) or self._presented_key()) for e in ENGINES},
+                self.server.route_snapshot)
+            realm = router.realm_for_unpinned(
+                snapshot, engine, settings.routing())
+            if not realm:
+                return query
+            sys.stderr.write(
+                "[portal] %s: 引擎当前出口没号，本次钉 realm=%s（%s）\n"
+                % (engine, realm, upstream_path))
+            sys.stderr.flush()
+            return (query + "&" if query else "") + "realm=" + realm
+        except Exception as exc:            # noqa: BLE001 —— 改道失败绝不能影响转发
+            sys.stderr.write("[portal] pin realm skipped: %s\n" % (exc,))
+            sys.stderr.flush()
+            return query
 
     def _proxy_stream(self, engine, upstream_path, query, method, body, upstream_key,
                       accept_retryable=True):
