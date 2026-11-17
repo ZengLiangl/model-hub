@@ -98,6 +98,34 @@ def _key_for(key, engine):
     return key
 
 
+def _realm_counts_from_accounts(ports):
+    """按区数账号：引擎没在 /health 报 accounts_by_realm 时的兜底（trae / qd）。
+
+    由来（用户报的）：下拉里出现了 claude-opus-4.7 / claude-sonnet-4.6，可这台机器
+    **一个国际账号都没有**。那两个模型只挂在 trae 的 intl 目录里；trae 的 /health
+    只报总数（accounts=1）、不报按区数，于是 publishing_realms 按「没报 = 两区照发」
+    处理 —— 清单里就多了两条点不动的模型。
+
+    这里换一条不会骗人的路：直接问引擎的账号池（/accounts?realm=all，每条自带
+    realm），数出来就是 {engine: {realm: n}}。取不到就不给这个键，调用方仍按
+    「不知道 = 不猜」处理（老行为不变）。
+    """
+    try:
+        from hub.core import aggregator        # 延迟导入：core 内部避免循环引用
+        doc = aggregator.hub_accounts(ports)
+    except Exception:
+        return {}
+    out = {}
+    for item in (doc.get("items") or []):
+        engine = str(item.get("engine") or "").strip().lower()
+        if engine not in ENGINES:
+            continue
+        realm = str(item.get("realm") or "").strip().lower()
+        bucket = out.setdefault(engine, {})
+        bucket[realm] = bucket.get(realm, 0) + 1
+    return out
+
+
 def _int_or_none(value):
     """能转成 int 就转，转不了（缺字段 / None / 非数）就给 None。
 
@@ -162,6 +190,14 @@ def refresh_snapshot(ports, key, snapshot, force=False):
             else:
                 errors[engine] = "models %s %s" % (realm, status)
             models[engine][realm] = ids
+    # ★ 引擎没报 accounts_by_realm 的（trae / qd）：去它的账号池数一遍。
+    #   否则「没报 = 两区照发」会把没号的区也发布出去（实测 trae 只有 cn 号，
+    #   却把 intl 目录里的 claude-* 发进了合并清单）。
+    missing = [e for e in ENGINES if e in models and by_realm.get(e) is None]
+    if missing:
+        for engine, counts in _realm_counts_from_accounts(ports).items():
+            if engine in missing and counts:
+                by_realm[engine] = counts
     with snapshot.lock:
         snapshot.models = models
         snapshot.ready = ready

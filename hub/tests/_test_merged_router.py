@@ -255,6 +255,31 @@ H.check("R38 同一份快照走真实现：链里没有 (wb,intl)",
         ("wb", "intl") not in router.candidates_for("m", _s_ctrl, CFG_CN_AUTO),
         router.candidates_for("m", _s_ctrl, CFG_CN_AUTO))
 
+# ---- 引擎没报按区数时：按账号池数（第 248 轮）----
+# 由来（用户报的）：下拉里出现 claude-opus-4.7 / claude-sonnet-4.6，可这台机器
+# 一个国际账号都没有 —— 那两个模型只挂在 trae 的 intl 目录里，而 trae 的 /health
+# 只报总数、不报按区数，于是「没报 = 两区照发」把它们发了出去。
+from unittest import mock as _mock          # noqa: E402
+from hub.core import aggregator as _agg     # noqa: E402
+
+_fake_pool = {"items": [{"engine": "trae", "realm": "cn"},
+                        {"engine": "wb", "realm": "cn"},
+                        {"engine": "wb", "realm": "cn"}], "errors": {}}
+with _mock.patch.object(_agg, "hub_accounts", lambda ports: _fake_pool):
+    H.eq("R39 按账号池数出按区账号数（trae 只有 cn、wb 两个 cn）",
+         router._realm_counts_from_accounts({"wb": 1, "qd": 2, "trae": 3}),
+         {"trae": {"cn": 1}, "wb": {"cn": 2}})
+with _mock.patch.object(_agg, "hub_accounts", side_effect=RuntimeError("boom")):
+    H.eq("R39b 账号池取不到 -> 空 dict（不猜，老行为不变）",
+         router._realm_counts_from_accounts({"wb": 1}), {})
+
+# 拿到按区数之后，清单要真的收窄（否则这个兜底等于没生效）
+s = SnapAcct({"trae": {"cn": {"trae-cn-model"}, "intl": {"claude-opus-4.7"}}},
+             {}, {"trae": 1}, {"trae": {"cn": 1}})
+H.eq("R40 trae 只有国内号 -> intl 独有模型（claude-*）不进合并清单",
+     [d["id"] for d in router.merged_model_list(s)], ["trae-cn-model"])
+H.eq("R40b 发布范围只剩 cn", router.publishing_realms(s)["trae"], ["cn"])
+
 # ---------- 三协议 model 提取 ----------
 for label, doc in (("chat", {"model": "glm-5.3-flash", "messages": []}),
                    ("responses", {"model": "glm-5.3-flash", "stream": True}),
