@@ -5,7 +5,7 @@ import { AlertTriangle, RefreshCw, Users } from 'lucide-react';
 import { Button, Card, EmptyState, EngineBadge, SkeletonRows } from '@/components/ui';
 import { AreaChart, BarChart, Donut, Sparkline } from '@/components/charts';
 import { useLang } from '@/lib/i18n';
-import { ENGINE_LABELS, ENGINES, engineLogs, engineUsage, fanout, hubHealth, type Engine, type LogRow } from '@/lib/api';
+import { ENGINE_LABELS, ENGINES, engineLogs, engineRecentUsage, engineUsage, fanout, hubHealth, type Engine, type LogRow, type RecentRequestRow } from '@/lib/api';
 import { bucketSeries, ratio } from '@/lib/series';
 
 function fmt(n: number | undefined): string {
@@ -54,6 +54,18 @@ export default function OverviewView() {
     },
   });
 
+  /** 失败请求：读**账本**（/usage/recent），不读运行日志。
+   *
+   * 运行日志是每引擎 200 行的环形缓冲，一忙就滚没；而上面的「失败请求」KPI 数的是
+   * 账本里今天累计的行。两处窗口不同就会出现「上面 318 条失败、下面 0 条记录」
+   * （2026-11-17 实测：22:37 后的日志窗口里一条 ERROR 都没有，失败全在 21 点那波
+   * 之前的账本里，或者压根不是 ERROR 级别）。
+   */
+  const recent = useQuery({
+    queryKey: ['overview-recent'],
+    queryFn: () => fanout((eng: Engine) => engineRecentUsage(eng, 200)),
+  });
+
   const totals = useMemo(() => {
     const values = Object.values(usage.data?.values ?? {}) as Array<Record<string, number> | undefined>;
     const sum = (k: string) => values.reduce((a, r) => a + (Number(r?.[k]) || 0), 0);
@@ -95,12 +107,38 @@ export default function OverviewView() {
     return Array.from(map, function (e) { return { label: e[0], value: e[1] }; }).sort(function (a, b) { return b.value - a.value; }).slice(0, 6);
   }, [usage.data]);
 
-  /** 最近错误：运维每天第一眼要看的东西，直接摆在概览上 */
-  const recentErrors = useMemo(function () {
-    return (logs.data?.rows ?? [])
-      .filter(function (x) { return String(x.row.level || '').toLowerCase() === 'error'; })
-      .slice(0, 6);
-  }, [logs.data]);
+  /** 最近的**失败请求**（账本口径）：运维每天第一眼要看的东西，直接摆在概览上。
+   *
+   * 只算 outcome=failed；client_aborted（客户端主动断开）单独记数 —— 它不是网关
+   * 故障，混进来会把成功率和错误卡都染红（实测 148 条中断顶起了「失败」的三分之一）。
+   */
+  const recentFailures = useMemo(function () {
+    const rows: { eng: Engine; row: RecentRequestRow }[] = [];
+    for (const eng of ENGINES) {
+      for (const row of (recent.data?.values?.[eng]?.rows ?? [])) {
+        if (String(row.outcome || '') === 'failed') rows.push({ eng: eng, row: row });
+      }
+    }
+    rows.sort(function (a, b) { return Number(b.row.at || 0) - Number(a.row.at || 0); });
+    return rows;
+  }, [recent.data]);
+
+  /** 窗口内实际看了多少条请求（副标题要说清「在这 M 条里」） */
+  const recentScanned = useMemo(function () {
+    let n = 0;
+    for (const eng of ENGINES) n += (recent.data?.values?.[eng]?.rows ?? []).length;
+    return n;
+  }, [recent.data]);
+
+  const abortedCount = useMemo(function () {
+    let n = 0;
+    for (const eng of ENGINES) {
+      for (const row of (recent.data?.values?.[eng]?.rows ?? [])) {
+        if (String(row.outcome || '') === 'client_aborted') n += 1;
+      }
+    }
+    return n;
+  }, [recent.data]);
 
   const failed = Array.from(new Set([...(usage.data?.failed ?? []), ...(logs.data?.failed ?? [])]));
   const usageAllFailed = (usage.data?.failed?.length ?? 0) === ENGINES.length;
@@ -113,9 +151,9 @@ export default function OverviewView() {
   const successRate = ratio(totals.requests, attempts);
 
   function retryAll() {
-    void health.refetch(); void usage.refetch(); void logs.refetch();
+    void health.refetch(); void usage.refetch(); void logs.refetch(); void recent.refetch();
   }
-  const busy = health.isFetching || usage.isFetching || logs.isFetching;
+  const busy = health.isFetching || usage.isFetching || logs.isFetching || recent.isFetching;
 
   if (loading) {
     return (
@@ -171,7 +209,14 @@ export default function OverviewView() {
       {/* KPI 条 */}
       <div className="grid gap-3 @lg:grid-cols-2 @3xl:grid-cols-4">
         <Kpi label={t('overview.kpi.requests')} value={fmt(attempts)} hint={t('engine.online', { up: String(ENGINES.filter(function (e) { return engines[e] && engines[e].ok !== false; }).length), total: String(ENGINES.length) })} />
-        <Kpi label={t('overview.kpi.errors')} value={fmt(totals.errors)} hint={successRate === undefined ? '—' : t('metrics.successRate') + ' ' + successRate.toFixed(1) + '%'} tone={totals.errors > 0 ? 'err' : undefined} />
+        <Kpi
+          label={t('overview.kpi.errors')}
+          value={fmt(totals.errors)}
+          hint={successRate === undefined
+            ? t('overview.kpi.errorsHint')
+            : t('metrics.successRate') + ' ' + successRate.toFixed(1) + '% · ' + t('overview.kpi.errorsHint')}
+          tone={totals.errors > 0 ? 'err' : undefined}
+        />
         <Kpi label={t('overview.kpi.tokens')} value={fmt(totals.tokens)} hint={t('overview.pool.ready') + ' ' + fmt(accountTotals.ready) + ' / ' + fmt(accountTotals.total)} />
         <Kpi label={t('overview.kpi.cost')} value={totals.cost > 0 ? money(totals.cost) : t('overview.kpi.noPricing')} hint={totals.credit > 0 ? t('overview.kpi.credits') + ' ' + fmt(totals.credit) : undefined} />
       </div>
@@ -192,7 +237,7 @@ export default function OverviewView() {
           </div>
         </Card>
 
-        <Card title={t('metrics.successRate')}>
+        <Card title={t('metrics.successRate')} subtitle={t('overview.successRate.sub')}>
           <div className="flex items-center gap-4">
             <Donut
               segments={[{ value: totals.requests, tone: 'accent-2' }, { value: totals.errors, tone: 'err' }]}
@@ -213,21 +258,45 @@ export default function OverviewView() {
           <BarChart data={byModel} maxRows={6} formatValue={fmt} ariaLabel={t('metrics.byModel')} />
         </Card>
 
-        <Card title={t('logs.tab.errors')} subtitle={t('overview.errors.subtitle', { n: recentErrors.length })}>
-          {recentErrors.length === 0 ? (
-            <p className="py-6 text-center text-[11.5px] text-fg-mute">{t('logs.errorEmpty.title')}</p>
+        <Card
+          title={t('logs.tab.errors')}
+          subtitle={t('overview.errors.subtitle', {
+            m: recentScanned, n: recentFailures.length, a: abortedCount,
+          })}
+        >
+          {recentFailures.length === 0 ? (
+            <div className="py-6 text-center">
+              <p className="text-[11.5px] text-fg-mute">{t('overview.errors.empty', { m: recentScanned })}</p>
+              <button
+                onClick={function () { navigate('/logs'); }}
+                className="mt-2 cursor-pointer text-[11px] text-accent hover:underline"
+              >{t('overview.errors.open')}</button>
+            </div>
           ) : (
-            <ul className="flex flex-col">
-              {recentErrors.map(function (x, i) {
-                return (
-                  <li key={i} className="flex items-center gap-2 border-b border-line-faint py-1.5 last:border-0">
-                    <span className="w-[52px] shrink-0 font-mono text-[10.5px] tnum text-fg-mute">{String(x.row.ts ?? '').slice(11, 19) || '—'}</span>
-                    <EngineBadge engine={x.eng} className="shrink-0" />
-                    <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-fg-dim" title={String(x.row.msg ?? '')}>{String(x.row.msg ?? '')}</span>
-                  </li>
-                );
-              })}
-            </ul>
+            <>
+              <ul className="flex flex-col">
+                {recentFailures.slice(0, 6).map(function (x, i) {
+                  const iso = String(x.row.iso ?? '');
+                  const ms = Number(x.row.elapsed_ms) || 0;
+                  const detail = [
+                    String(x.row.model ?? '—'),
+                    ms ? ms + 'ms' : '',
+                  ].filter(Boolean).join(' · ');
+                  return (
+                    <li key={i} className="flex items-center gap-2 border-b border-line-faint py-1.5 last:border-0">
+                      <span className="w-[52px] shrink-0 font-mono text-[10.5px] tnum text-fg-mute">{iso.slice(11, 19) || '—'}</span>
+                      <EngineBadge engine={x.eng} className="shrink-0" />
+                      <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-fg-dim" title={detail}>{detail}</span>
+                      <span className="shrink-0 rounded bg-err-soft px-1.5 py-0.5 text-[10px] text-err">{t('overview.errors.failed')}</span>
+                    </li>
+                  );
+                })}
+              </ul>
+              <button
+                onClick={function () { navigate('/logs'); }}
+                className="mt-2 cursor-pointer text-[11px] text-accent hover:underline"
+              >{t('overview.errors.open')}</button>
+            </>
           )}
         </Card>
       </div>

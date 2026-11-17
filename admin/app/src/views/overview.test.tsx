@@ -76,27 +76,48 @@ describe('OverviewView 三态', () => {
     expect(status).toMatch(/Qoder/);
   });
 
-  // 回归守卫：错误卡的副标题曾经复用了**空态**那句文案（logs.errorEmpty.desc），
-  // 结果下面明明列着几条错误，卡片头上还写着「错误流水只在失败时才有内容」。
-  it('错误卡副标题随实际条数走，不冒充空态文案', async () => {
+  // 回归守卫（2026-11-17 实测）：错误卡原来读的是引擎**运行日志**里的 ERROR 行，
+  // 而上面的「失败请求」KPI 数的是**用量账本**。日志是每引擎 200 行的环形缓冲，
+  // 一忙就滚没了 —— 于是出现「上面 318 条失败、下面一条记录都没有」。
+  // 现在错误卡读 /usage/recent（账本级逐条记录），副标题写清窗口与口径。
+  it('错误卡读账本：列出失败请求，并把窗口与中断数写进副标题', async () => {
     mockFetch((url) => {
-      if (url.includes("/health")) return json({ ok: true, engines: {} });
-      if (url.includes("/wb/logs")) return json({ logs: [
-        { ts: "2026-11-17T22:04:27", level: "error", msg: "request error: status=503 no usable account" },
-        { ts: "2026-11-17T22:04:28", level: "error", msg: "models.dev refresh skipped" },
-        { ts: "2026-11-17T22:04:29", level: "info", msg: "ok line" },
+      if (url.includes('/health')) return json({ ok: true, engines: {} });
+      if (url.includes('/wb/usage/recent')) return json({ total: 3, rows: [
+        { at: 1794926789, iso: '2026-11-17T22:46:29', model: 'deepseek-v4.1-flash', outcome: 'failed', elapsed_ms: 2494 },
+        { at: 1794926780, iso: '2026-11-17T22:46:20', model: 'deepseek-v4.1-flash', outcome: 'failed', elapsed_ms: 3106 },
+        { at: 1794926770, iso: '2026-11-17T22:46:10', model: 'deepseek-v4.1-flash', outcome: 'client_aborted', elapsed_ms: 120 },
       ] });
-      if (url.includes("/logs")) return json({ logs: [] });
-      if (url.includes("/usage")) return json({ requests: 10, errors: 2, total_tokens: 1 });
+      if (url.includes('/usage/recent')) return json({ total: 0, rows: [] });
+      if (url.includes('/logs')) return json({ logs: [] });
+      if (url.includes('/usage')) return json({ requests: 10, errors: 2, total_tokens: 1 });
       return json({});
     });
     renderView();
-    await waitFor(() => expect(screen.getByText(/no usable account/)).toBeInTheDocument());
-    const errCard = screen.getByText(/no usable account/).closest("[class*=rounded-lg]") as HTMLElement | null;
-    const sub = document.body.textContent || "";
-    // jsdom 的语言跟随运行环境，断言不绑语言：中英两版都要能过。
-    expect(sub).toMatch(/(最近 2 条失败|Latest 2 failures)/);
+    await waitFor(() => expect(screen.getByText(/deepseek-v4\.1-flash · 2494ms/)).toBeInTheDocument());
+    const sub = document.body.textContent || '';
+    expect(sub).toMatch(/(最近 3 条请求里 2 条失败|2 failed out of the last 3 requests)/);
+    expect(sub).toMatch(/(客户端中断 1 条另计|1 client aborts excluded)/);
+    // 运行日志里那条 ERROR 不该再被当成「失败记录」的来源
     expect(sub).not.toMatch(/(错误流水只在失败时才有内容|This tab only fills up on failures)/);
-    expect(errCard).toBeTruthy();
+  });
+
+  it('只有客户端中断时不算失败：空态说明窗口并给出入口', async () => {
+    mockFetch((url) => {
+      if (url.includes('/health')) return json({ ok: true, engines: {} });
+      if (url.includes('/wb/usage/recent')) return json({ total: 2, rows: [
+        { at: 1794926789, iso: '2026-11-17T22:46:29', model: 'm', outcome: 'client_aborted' },
+        { at: 1794926780, iso: '2026-11-17T22:46:20', model: 'm', outcome: 'client_aborted' },
+      ] });
+      if (url.includes('/usage/recent')) return json({ total: 0, rows: [] });
+      if (url.includes('/logs')) return json({ logs: [] });
+      if (url.includes('/usage')) return json({ requests: 4, errors: 2, total_tokens: 1 });
+      return json({});
+    });
+    renderView();
+    await waitFor(() => expect(document.body.textContent || '').toMatch(/(最近 2 条请求里没有失败|No failures in the last 2 requests)/));
+    const sub = document.body.textContent || '';
+    expect(sub).toMatch(/(客户端中断 2 条另计|2 client aborts excluded)/);
+    expect(screen.getByRole('button', { name: /请求流水|Requests/i })).toBeInTheDocument();
   });
 });

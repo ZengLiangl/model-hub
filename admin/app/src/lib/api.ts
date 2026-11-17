@@ -231,6 +231,28 @@ export type UsagePayload = {
 export const engineUsage = (eng: Engine, realm?: string) =>
   get<UsagePayload>(API + "/" + eng + "/usage", realm ? { query: { realm: realm } } : undefined);
 
+/** 一次真实调用（/usage/recent 的一行）—— 账本级记录，带 outcome。
+ *
+ * 为什么要它：运行日志是个环形缓冲（每引擎只留最近 200 行），一忙就滚没了；
+ * 而「失败请求」这个 KPI 数的是账本。两处口径/窗口不同，就会出现
+ * 「上面 318 条失败、下面 0 条记录」——所以错误卡必须读账本，不能读日志。 */
+export type RecentRequestRow = {
+  at?: number;
+  iso?: string;
+  model?: string;
+  kind?: string;
+  outcome?: string;          // completed / failed / client_aborted
+  elapsed_ms?: number;
+  ttft_ms?: number;
+  gen_ms?: number;
+  stream?: boolean;
+  [k: string]: unknown;
+};
+
+export const engineRecentUsage = (eng: Engine, limit = 200) =>
+  get<{ total?: number; rows?: RecentRequestRow[] }>(
+    API + "/" + eng + "/usage/recent", { query: { limit } });
+
 export type SettingsPayload = Record<string, unknown> & {
   api_keys?: ApiKey[];
   deleted_api_keys?: ApiKey[];
