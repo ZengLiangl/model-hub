@@ -100,6 +100,56 @@ try:
 except Exception as exc:
     H.check("H6 hub_models 可调用", False, "%s: %s" % (type(exc).__name__, exc))
 
+# ---- H6b /api/hub/models 不并**没账号**的引擎（第 245 轮）----
+# 由来：引擎的 /v1/models 是目录，与有没有登录号无关 —— trae 池子空着也照样
+# 倒出整份静态清单，于是接口里出现一堆点不动的模型（实测 DeepSeek-V4-Flash）。
+_NO_ACCOUNTS = {"trae"}
+
+
+def fake_json_pool(engine, ports, path_, params=None, **kw):
+    if path_.endswith("/health") and engine in _NO_ACCOUNTS:
+        return {"ok": True, "service": engine + "-svc", "accounts": 0, "accounts_ready": 0}
+    return fake_json(engine, ports, path_, params, **kw)
+
+
+aggregator._json_or_none = fake_json_pool
+try:
+    models = aggregator.hub_models({e: 1 for e in ENGINES})
+    got = {m.get("engine") for m in (models or [])}
+    H.check("H6b /api/hub/models 不并 0 个号的引擎（其余照旧）",
+            got == WANT - _NO_ACCOUNTS, "实际引擎=%s" % sorted(x for x in got if x))
+except Exception as exc:                                    # noqa: BLE001
+    H.check("H6b /api/hub/models 可调用", False, "%s: %s" % (type(exc).__name__, exc))
+
+# 对照组：账号数取不到（引擎没报这个字段）= 不知道 -> 照并（不拿猜测删清单）
+aggregator._json_or_none = lambda engine, ports, path_, params=None, **kw: (
+    {"ok": True, "service": engine + "-svc", "accounts_ready": 0}
+    if path_.endswith("/health") else fake_json(engine, ports, path_, params, **kw))
+try:
+    models = aggregator.hub_models({e: 1 for e in ENGINES})
+    got = {m.get("engine") for m in (models or [])}
+    H.check("H6c 账号数未知时照并（四种口径里只摘「确知 0」）", got == WANT,
+            "实际引擎=%s" % sorted(x for x in got if x))
+except Exception as exc:                                    # noqa: BLE001
+    H.check("H6c /api/hub/models 可调用", False, "%s: %s" % (type(exc).__name__, exc))
+
+aggregator._json_or_none = fake_json          # 复原：后面的判据还用它
+
+# 对照组二：**一家号都没有** -> 退回目录视图（首次运行不留空清单，与
+# router.publishing_engines 同一口径）。三家都报 0，并集仍要覆盖三家。
+aggregator._json_or_none = lambda engine, ports, path_, params=None, **kw: (
+    {"ok": True, "service": engine + "-svc", "accounts": 0, "accounts_ready": 0}
+    if path_.endswith("/health") else fake_json(engine, ports, path_, params, **kw))
+try:
+    models = aggregator.hub_models({e: 1 for e in ENGINES})
+    got = {m.get("engine") for m in (models or [])}
+    H.check("H6d 一家号都没有时退回目录视图（不是空清单）", got == WANT,
+            "实际引擎=%s" % sorted(x for x in got if x))
+except Exception as exc:                                    # noqa: BLE001
+    H.check("H6d /api/hub/models 可调用", False, "%s: %s" % (type(exc).__name__, exc))
+
+aggregator._json_or_none = fake_json          # 复原
+
 # ---- H5 阳性对照：写死两家的实现必须被同一套断言判红 ----
 def bad_usage(ports, realm=None):
     return {"wb": {}, "qd": {}, "merged": {}}

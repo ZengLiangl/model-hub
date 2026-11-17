@@ -4,14 +4,15 @@
 
 一个合并 key 同时打国内/国际 × wb/qd 两引擎。路由矩阵由 portal 持有：
 
-  * 快照（TTL 8s）：两引擎 × 两区域的模型清单（/v1/models?realm=X）+ 总就绪
-    账号数（/health）—— 本地回环探测，失败不致命（该引擎/区域不参与候选）。
+  * 快照（TTL 8s）：两引擎 × 两区域的模型清单（/v1/models?realm=X）+ 账号总数
+    与总就绪账号数（/health）—— 本地回环探测，失败不致命（该引擎/区域不参与候选）。
   * 候选序列 candidates_for(model)：
       区域优先：prefer_realm（默认 cn）先，另一区兜底；
       区域内引擎顺序：engine_prefer=auto 时按就绪账号多者先（并列 wb 先），
       显式 wb/qd 时按指定顺序。
   * 兜底语义：portal 逐个尝试候选，503/429/502/504（未流式输出前）换下一个。
-  * 合并模型清单 merged_model_list()：同名模型合一条，带 engines 与 realm。
+  * 合并模型清单（/v1/models）：同名模型合一条，带 engines 与 realm；
+    **只有账号的引擎才发布**（见 publishing_engines）。
 
 只用标准库。
 """
@@ -39,13 +40,18 @@ SNAPSHOT_TTL = 30.0
 
 
 class RouteSnapshot(object):
-    """路由快照：models[engine][realm]=set(ids)；ready[engine]=int|None。"""
+    """路由快照：models[engine][realm]=set(ids)；ready[engine]=int|None。
+
+    accounts[engine] = 该引擎的账号**总数**（/health 的 accounts），
+    None = 不知道（引擎没报这个字段 / /health 没答上来）—— 与 0 是两回事。
+    """
 
     def __init__(self):
         self.lock = threading.Lock()
         self.at = 0.0
         self.models = {}
         self.ready = {}
+        self.accounts = {}
         self.errors = {}
 
     def is_fresh(self):
@@ -83,23 +89,44 @@ def _key_for(key, engine):
     return key
 
 
+def _int_or_none(value):
+    """能转成 int 就转，转不了（缺字段 / None / 非数）就给 None。
+
+    「不知道」与「0」必须分开：0 个账号是**确定的事实**（这台引擎没接任何号，
+    模型不该对外发布），不知道只能按老行为放过（见 publishing_engines）。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def refresh_snapshot(ports, key, snapshot, force=False):
     """按 TTL 重建快照；并发调用只让一个线程真正探测。"""
     if not force and snapshot.is_fresh():
         return snapshot
-    models, ready, errors = {}, {}, {}
+    models, ready, accounts, errors = {}, {}, {}, {}
     for engine in ENGINES:
         port = (ports or {}).get(engine)
         if not port:
             continue
-        models[engine], ready[engine], errors[engine] = {}, None, None
+        models[engine], ready[engine], accounts[engine] = {}, None, None
+        errors[engine] = None
         status, body = _http(port, "/health")
         if status == 200:
             try:
                 doc = json.loads(body.decode("utf-8", "replace"))
-                ready[engine] = int(doc.get("accounts_ready") or 0)
             except Exception:
-                ready[engine] = None
+                doc = None
+            if isinstance(doc, dict):
+                # ready 保留老口径：缺字段就是 0（老代码就是这么算排序权重的）。
+                ready[engine] = _int_or_none(doc.get("accounts_ready")) or 0
+                # ★ 账号**总数**（第 245 轮）：0 个号 = 这台引擎其实什么都没接，
+                #   但它的 /v1/models 照样倒出静态目录 —— 发布清单时要整段摘掉
+                #   （见 publishing_engines / merged_model_list）。
+                accounts[engine] = _int_or_none(doc.get("accounts"))
+            else:
+                errors[engine] = "health parse error"
         else:
             errors[engine] = "health %s" % status
         for realm in REALMS:
@@ -121,6 +148,7 @@ def refresh_snapshot(ports, key, snapshot, force=False):
     with snapshot.lock:
         snapshot.models = models
         snapshot.ready = ready
+        snapshot.accounts = accounts
         snapshot.errors = errors
         snapshot.at = time.time()
     return snapshot
@@ -128,6 +156,39 @@ def refresh_snapshot(ports, key, snapshot, force=False):
 
 def engine_holds(snapshot, engine, realm, model):
     return model in ((snapshot.models.get(engine) or {}).get(realm) or set())
+
+
+def engine_accounts(snapshot, engine):
+    """该引擎的账号总数；None = 不知道（引擎没报这个字段 / 没探测到）。"""
+    return (getattr(snapshot, "accounts", None) or {}).get(engine)
+
+
+def engine_has_accounts(snapshot, engine):
+    """**确知**这家有号？None/未知一律按「有」处理（口径见 publishing_engines）。"""
+    n = engine_accounts(snapshot, engine)
+    return n is None or n > 0
+
+
+def publishing_engines(snapshot):
+    """这一轮对外发布哪几家引擎 —— 清单口径的**唯一入口**。
+
+    为什么要它：引擎的 /v1/models 是「目录」，不是「我现在能服务什么」——
+    trae 一个号都没登录时照样把整份静态目录（实测 cn 20 条聊天模型）倒出来，
+    于是合并清单里出现一批点不动的模型（实测 DeepSeek-V4-Flash 只挂在 trae 上，
+    请求它必然失败）。
+
+    两条规则：
+      1. **确知 0 个号**的引擎整段不发布，只挂在它上面的模型因此整条不返回；
+      2. 但**一家号都没有**时退回目录视图（全部照发）—— 那是「还没配好」的首次
+         运行状态，发一张空清单连「这个网关支持哪些模型」都看不到，比多列几条
+         点不动的更糟（首次运行自检 F07 就是这么红的）。加了号之后下一次快照
+         就按规则 1 收窄。
+
+    账号数未知（老引擎没报这个字段 / /health 没答上来）一律按「有」处理 ——
+    这一层只摘「确知没号」的，不猜，也不让清单因探测抖动凭空消失。
+    """
+    have = [e for e in ENGINES if engine_has_accounts(snapshot, e)]
+    return have or list(ENGINES)
 
 
 def candidates_for(model, snapshot, config, requested=None):
@@ -165,9 +226,20 @@ def candidates_for(model, snapshot, config, requested=None):
 
 
 def merged_model_list(snapshot):
-    """合并 /v1/models：同名模型合一条，带 engines（含区域）与 realm 并集。"""
+    """合并 /v1/models：同名模型合一条，带 engines（含区域）与 realm 并集。
+
+    ★ 只发布**有账号**的引擎（见 publishing_engines）：没号的引擎整段跳过，
+      只挂在它上面的模型因此整条不返回。engines 里仍保留全部引擎键，没号 /
+      没这个模型的给空列表 —— 键集合稳定，前端不必猜这一家是不是压根没出现。
+
+    它只管**清单**，不管路由：candidates_for 仍按快照全量给候选，客户端手写
+    一个只挂在没号引擎上的模型名时，失败码是引擎自己的真实回包。
+    """
+    publish = set(publishing_engines(snapshot))
     by_id = {}
     for engine in ENGINES:
+        if engine not in publish:
+            continue
         for realm in REALMS:
             for mid in sorted((snapshot.models.get(engine) or {}).get(realm) or set()):
                 entry = by_id.setdefault(mid, {

@@ -96,6 +96,65 @@ H.check("R09 单区 -> realm_exclusive=True", one and one[0]["realm_exclusive"] 
 s = snap({"wb": {"cn": {"b", "a"}}}, {})
 H.eq("R10 合并清单按 id 排序", [d["id"] for d in router.merged_model_list(s)], ["a", "b"])
 
+# ---------- 只发有账号的引擎（第 245 轮）----------
+# 由来：引擎的 /v1/models 是「目录」，与有没有登录号无关 —— trae 池子空着也照样
+# 倒出整份静态清单，于是合并清单里全是点不动的模型（实测 DeepSeek-V4-Flash 只挂在
+# trae 上）。快照因此多记一个 /health.accounts（账号总数），0 个号的引擎不发。
+class SnapAcct(Snapshot):
+    def __init__(self, models=None, ready=None, accounts=None):
+        Snapshot.__init__(self, models=models, ready=ready)
+        self.accounts = accounts or {}
+
+
+s = SnapAcct({"wb": {"cn": {"m"}}, "trae": {"cn": {"only-trae"}, "intl": {"only-trae"}}},
+             {"wb": 1, "trae": 0}, {"wb": 2, "trae": 0})
+by_id = {d["id"]: d for d in router.merged_model_list(s)}
+H.check("R22 0 个号的引擎不发布：只挂在它上面的模型整条不返回",
+        "only-trae" not in by_id and "m" in by_id, sorted(by_id))
+H.eq("R22b engines 键集合照旧含全部引擎（没号的那家给空列表）",
+     sorted(by_id["m"].get("engines") or {}), sorted(router.ENGINES))
+H.eq("R22c 有号的引擎照常列", by_id["m"]["engines"].get("wb"), ["cn"])
+
+s = SnapAcct({"wb": {"cn": {"m"}}, "trae": {"intl": {"m"}}}, {}, {"wb": 3, "trae": 0})
+by_id = {d["id"]: d for d in router.merged_model_list(s)}
+H.eq("R23 同名模型：没号引擎贡献的那一区也从 realm 并集里消失",
+     (by_id["m"]["engines"].get("trae"), by_id["m"]["realm"],
+      by_id["m"]["realm_exclusive"]), ([], ["cn"], True))
+
+s = SnapAcct({"wb": {"cn": {"m"}}, "qd": {"cn": {"n"}}}, {},
+             {"wb": 0, "qd": 0, "trae": 0})
+H.eq("R24 一家号都没有 -> 退回目录视图（首次运行不留空清单）",
+     [d["id"] for d in router.merged_model_list(s)], ["m", "n"])
+
+H.eq("R25 账号数未知（老引擎没报 / health 没答）-> 照发，不拿猜测删清单",
+     [d["id"] for d in router.merged_model_list(snap({"wb": {"cn": {"m"}}}, {}))], ["m"])
+H.eq("R25b engine_has_accounts：未知=True / 0=False / 正数=True",
+     (router.engine_has_accounts(snap({}, {}), "trae"),
+      router.engine_has_accounts(SnapAcct({}, {}, {"trae": 0}), "trae"),
+      router.engine_has_accounts(SnapAcct({}, {}, {"trae": 2}), "trae")),
+     (True, False, True))
+H.eq("R25c publishing_engines：有号才发 / 一家都没号时全发",
+     (router.publishing_engines(SnapAcct({}, {}, {"wb": 1, "qd": 0, "trae": 0})),
+      router.publishing_engines(SnapAcct({}, {}, {"wb": 0, "qd": 0, "trae": 0}))),
+     (["wb"], list(router.ENGINES)))
+
+# 阳性对照：把过滤去掉（等价于老实现）必须让 R22 判红 —— 防止判据本身写空。
+class _Unfiltered(object):
+    @staticmethod
+    def merged_model_list(snapshot):
+        by_id = {}
+        for engine in router.ENGINES:
+            for realm in router.REALMS:
+                for mid in (snapshot.models.get(engine) or {}).get(realm) or set():
+                    by_id.setdefault(mid, {"id": mid, "engines": {}})
+        return [by_id[k] for k in sorted(by_id)]
+
+
+_bad = _Unfiltered.merged_model_list(
+    SnapAcct({"trae": {"cn": {"only-trae"}}}, {}, {"wb": 1, "trae": 0}))
+H.check("R26 阳性对照：不过滤时 only-trae 会漏出来（判据不是空的）",
+        any(d["id"] == "only-trae" for d in _bad), _bad)
+
 # ---------- 三协议 model 提取 ----------
 for label, doc in (("chat", {"model": "glm-5.3-flash", "messages": []}),
                    ("responses", {"model": "glm-5.3-flash", "stream": True}),

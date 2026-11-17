@@ -510,14 +510,40 @@ def hub_timeseries(ports, realm=None, range_="week", since=None, until=None, buc
             "errors": errors, "bucket_seconds": bucket_seconds}
 
 
+def _engine_has_accounts(engine, ports):
+    """该引擎至少有 1 个账号？取不到数字（引擎挂了 / 没报这个字段）→ True。"""
+    info = _json_or_none(engine, ports, "/health", token=False)
+    if not isinstance(info, dict):
+        return True
+    try:
+        return int(info.get("accounts")) > 0
+    except (TypeError, ValueError):
+        return True
+
+
+def _publishing_engines(ports):
+    """这一轮对外发布哪几家 —— 与 hub/core/router.py 的 publishing_engines 同一口径。
+
+    只摘「确知 0 个号」的引擎，不知道就当有；但**一家号都没有**时退回目录视图
+    （那是还没配好的首次运行状态，发空清单更糟）。两处必须同口径，否则
+    `/api/v1/models` 与 `/api/hub/models` 会互相打脸。
+    """
+    have = [e for e in ENGINES if _engine_has_accounts(e, ports)]
+    return have or list(ENGINES)
+
+
 def hub_models(ports):
     """两边 /v1/models 的并集，每条**原样透传**并打上 engine 标。
 
     返回 list；某个引擎取不到就只是不贡献条目（不抛、不占位）。
     条目的其余字段一个不动：这一层不做归一化，归一化是视图的事。
+
+    ★ 只并**有账号**的引擎（第 245 轮）：引擎的 /v1/models 是目录，与有没有号
+      无关 —— 池子空着的引擎照样倒出整份静态清单，于是接口/面板里出现一堆
+      根本调不动的模型（实测：trae 0 个号，DeepSeek-V4-Flash 还挂在上面）。
     """
     out = []
-    for engine in ENGINES:
+    for engine in _publishing_engines(ports):
         doc = _json_or_none(engine, ports, "/v1/models")
         if not isinstance(doc, dict):
             continue

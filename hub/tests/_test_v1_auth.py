@@ -33,6 +33,7 @@ ENGINES = ("wb", "qd", "trae")
 class FakeEngine(BaseHTTPRequestHandler):
     name = "wb"
     fail_status = 0        # 0 = 正常；503 之类 = 该引擎的 chat 直接失败
+    accounts = 1           # /health 报的**账号总数**（0 = 池子空着，第 245 轮的判据用它）
 
     def log_message(self, *a):        # 静音
         pass
@@ -41,7 +42,8 @@ class FakeEngine(BaseHTTPRequestHandler):
         path = self.path.split("?")[0].rstrip("/") or "/"
         if path.endswith("/health"):
             body = {"ok": True, "service": self.name + "-svc", "version": "1.0.0",
-                    "accounts": 1, "realm": "cn"}
+                    "accounts": self.accounts,
+                    "accounts_ready": 1 if self.accounts else 0, "realm": "cn"}
         elif path.endswith("/v1/models"):
             # 每家都给一个**同名**模型：只有候选集合里同时有它，路由才会跨引擎回退。
             body = {"data": [{"id": self.name + "-model", "object": "model"},
@@ -77,8 +79,9 @@ class FakeEngine(BaseHTTPRequestHandler):
 FAKE_CLASSES = {}
 
 
-def start_fake(name, fail_status=0):
-    cls = type("Fake_" + name, (FakeEngine,), {"name": name, "fail_status": fail_status})
+def start_fake(name, fail_status=0, accounts=1):
+    cls = type("Fake_" + name, (FakeEngine,),
+               {"name": name, "fail_status": fail_status, "accounts": accounts})
     FAKE_CLASSES[name] = cls          # 留个引用：后面要运行时改"谁失败"
     srv = ThreadingHTTPServer(("127.0.0.1", 0), cls)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -149,8 +152,8 @@ if not wait_portal():
 H.check("V00 门户在测试里起得来", True, "")
 
 
-def call_models(key):
-    req = urllib.request.Request(base + "/api/v1/models")
+def call_models(key, base_url=None):
+    req = urllib.request.Request((base_url or base) + "/api/v1/models")
     if key:
         req.add_header("Authorization", "Bearer " + key)
     try:
@@ -284,5 +287,84 @@ H.check("V9b 三家都试过（候选是引擎×区域对）", tried == set(ENGI
 
 for _name, _cls in FAKE_CLASSES.items():
     _cls.fail_status = 0             # 还原
+
+# ---- V10 没有账号的引擎：它的模型不进合并清单（第 245 轮）----
+# 由来：引擎的 /v1/models 是「目录」，与有没有登录号无关 —— trae 池子空着也照样
+# 倒出整份静态清单，于是合并清单里出现点不动的模型（实测 DeepSeek-V4-Flash 只挂在
+# trae 上）。这里另起一套假引擎（trae 0 个号）+ 一个新门户：快照是新起的，
+# 不必等 30 秒 TTL，也不会污染上面那套已经跑完的判据。
+ports2, servers2 = {}, []
+for eng in ENGINES:
+    srv2, port2 = start_fake(eng, accounts=(0 if eng == "trae" else 1))
+    servers2.append(srv2)
+    ports2[eng] = port2
+
+portal2_port = H.free_port()
+argv2 = ["--host", "127.0.0.1", "--port", str(portal2_port)]
+for eng in ENGINES:
+    argv2 += ["--%s-port" % eng, str(ports2[eng])]
+threading.Thread(target=portal.main, args=(argv2,), daemon=True).start()
+base2 = "http://127.0.0.1:%d" % portal2_port
+
+
+def wait_portal2(limit=15.0):
+    import time
+    end = time.time() + limit
+    while time.time() < end:
+        try:
+            with urllib.request.urlopen(base2 + "/api/hub/health", timeout=2) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def ids_of(doc):
+    return [str(i.get("id") or "") for i in ((doc or {}).get("data") or [])]
+
+
+if not wait_portal2():
+    H.check("V10 第二个门户（trae 0 个号）起得来", False, "15s 内没应答 /api/hub/health")
+else:
+    status, doc2 = call_models("mk-all", base2)
+    ids = ids_of(doc2)
+    H.check("V10 trae 没有账号 -> 只挂在 trae 上的模型整条不返回（同名的不受影响）",
+            status == 200 and "trae-model" not in ids
+            and "wb-model" in ids and "common-model" in ids,
+            "status=%s ids=%s" % (status, ids))
+    counts = (doc2 or {}).get("counts") or {}
+    H.check("V10b counts 里没号的引擎是 0，有号的照旧（其他引擎不受牵连）",
+            counts.get("trae") == 0 and (counts.get("wb") or 0) > 0,
+            "counts=%s" % (counts,))
+    hidden = (doc2 or {}).get("hidden") or {}
+    H.check("V10c 摘掉多少条留在 hidden 里（排障看得见，不是悄悄消失）",
+            (hidden.get("trae") or 0) > 0 and (hidden.get("wb") or 0) == 0,
+            "hidden=%s" % (hidden,))
+
+    # 反向对照：引擎自己的目录**不删**（这是「不发」不是「删」）。
+    # trae 的 key 打到同一个门户，仍然看到 trae 那份静态目录。
+    status, doc3 = call_models("ek-trae", base2)
+    H.check("V11 引擎 key 仍能拿到它自己的目录（不发 != 删）",
+            status == 200 and "trae-model" in ids_of(doc3),
+            "status=%s ids=%s" % (status, ids_of(doc3)))
+
+    # 账号回来（同一个测试进程里改假引擎）-> 重建快照后 trae 的模型放回来。
+    # 快照 TTL 是 30s，这里借用 /api/hub/routing/preview 强制重建（它做的就是
+    # refresh_snapshot(force=True)），不去干等 30 秒。
+    for _cls in list(FAKE_CLASSES.values()):
+        _cls.accounts = 1
+    try:
+        _req = urllib.request.Request(base2 + "/api/hub/routing/preview",
+                                      data=b"{}", method="POST")
+        _req.add_header("Content-Type", "application/json")
+        urllib.request.urlopen(_req, timeout=10).read()
+    except Exception as exc:                       # noqa: BLE001
+        H.check("V12 强制重建快照（POST /api/hub/routing/preview）可用", False, str(exc))
+    status, doc4 = call_models("mk-all", base2)
+    H.check("V12 账号数不再为 0 时清单恢复（口径只看当前快照）",
+            status == 200 and "trae-model" in ids_of(doc4),
+            "status=%s ids=%s" % (status, ids_of(doc4)))
 
 H.finish()
