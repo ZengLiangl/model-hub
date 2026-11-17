@@ -31,6 +31,8 @@ venv/
 _backup_*/
 .bug-data/
 .shots/
+# 本地人工复验截图（不该进仓库；正式截图放 docs/merge/shots/）
+.screenshots/
 .env
 .env.*
 *.local
