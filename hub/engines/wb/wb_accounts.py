@@ -289,7 +289,9 @@ def opener_for_proxy(proxy):
         opener = _OPENER_CACHE.get(proxy)
         if opener is None:
             opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(
+                    context=wb_upstream_pool.shared_ssl_context()),
             )
             _OPENER_CACHE[proxy] = opener
         return opener
@@ -324,7 +326,9 @@ def urlopen(req, timeout=30, proxy=""):
                 raise RuntimeError("TLS bridge cannot handle this proxy or redirect") from None
     opener = opener_for_proxy(proxy)
     if opener is None:
-        return urllib.request.urlopen(req, timeout=timeout)
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(
+                context=wb_upstream_pool.shared_ssl_context()))
     return opener.open(req, timeout=timeout)
 
 
@@ -5419,9 +5423,7 @@ class AccountPool(object):
             acct_headers = dict(headers)
             acct_headers["Authorization"] = "Bearer " + token
             req_acct = urllib.request.Request(acct_url, method="GET", headers=acct_headers)
-            # Direct logins keep the exact pre-slot path (plain urllib).
-            opened = (urlopen(req_acct, timeout=15, proxy=proxy_url) if proxy_url
-                      else urllib.request.urlopen(req_acct, timeout=15))
+            opened = urlopen(req_acct, timeout=15, proxy=proxy_url)
             with opened as resp_acct:
                 profile = json.loads(resp_acct.read().decode("utf-8"))
                 profile_data = profile.get("data") or {}

@@ -30,6 +30,8 @@ import os
 import platform
 import re
 import socket
+import ssl
+import subprocess
 import threading
 import time
 import urllib.error
@@ -108,6 +110,8 @@ OAUTH_HTTP_TIMEOUT = 30
 
 _OAUTH_SESSIONS = {}
 _OAUTH_LOCK = threading.Lock()
+_OAUTH_SSL_CONTEXT = None
+_OAUTH_SSL_LOCK = threading.Lock()
 
 
 def _b64url(raw):
@@ -204,6 +208,57 @@ def _oauth_machine_id(seed):
     return hashlib.sha256(("trae-machine:%s" % seed).encode("utf-8")).hexdigest()
 
 
+def _system_ca_pem():
+    """返回本机系统信任库的 PEM（macOS 钥匙串 + 系统证书文件）。
+
+    python.org 官方安装的 CPython 自带 CA bundle 会缺部分中间证书（如
+    RapidSSL TLS RSA CA G1），访问 api.trae.com.cn 时报 self-signed in chain，
+    而 curl / 浏览器走 macOS 系统钥匙串则正常。这里把系统信任库追加进来补全。
+    失败一律返回空串，由调用方回退到默认 context。
+    """
+    parts = []
+    if platform.system() == "Darwin":
+        try:
+            out = subprocess.run(
+                ["security", "find-certificate", "-a", "-p",
+                 "/System/Library/Keychains/SystemRootCertificates.keychain"],
+                capture_output=True, text=True, timeout=10).stdout or ""
+            if out.strip():
+                parts.append(out)
+        except Exception:
+            pass
+    for path in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
+        try:
+            if os.path.isfile(path):
+                with open(path, "rb") as fh:
+                    parts.append(fh.read().decode("utf-8", "replace"))
+        except Exception:
+            pass
+    return "\n".join(p for p in parts if p.strip())
+
+
+def _oauth_ssl_context():
+    """进程级共享出站 SSL context：默认校验之上叠加系统信任库（懒建、只建一次）。
+
+    只补全证书链，**不放松校验**：verify_mode 仍为 CERT_REQUIRED、check_hostname
+    仍开启。python.org 的 CPython 自带 CA bundle 与系统钥匙串不一致时，这条
+    补丁让 Trae 上游（api.trae.com.cn 等）的证书链能被正确验证。
+    """
+    global _OAUTH_SSL_CONTEXT
+    if _OAUTH_SSL_CONTEXT is None:
+        with _OAUTH_SSL_LOCK:
+            if _OAUTH_SSL_CONTEXT is None:
+                ctx = ssl.create_default_context()
+                extra = _system_ca_pem()
+                if extra:
+                    try:
+                        ctx.load_verify_locations(cadata=extra)
+                    except Exception:
+                        pass
+                _OAUTH_SSL_CONTEXT = ctx
+    return _OAUTH_SSL_CONTEXT
+
+
 def _oauth_http_json(url, payload, token="", timeout=OAUTH_HTTP_TIMEOUT):
     """POST JSON 到 Trae 上游，返回 (Result dict, 原始响应)。"""
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -215,7 +270,8 @@ def _oauth_http_json(url, payload, token="", timeout=OAUTH_HTTP_TIMEOUT):
         "X-Request-Id": uuid.uuid4().hex,
     })
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout,
+                                    context=_oauth_ssl_context()) as resp:
             raw = resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -842,7 +898,8 @@ def _fallback_refresh(account, timeout=30):
         "User-Agent": cfg["ua"],
     })
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout,
+                                    context=_oauth_ssl_context()) as resp:
             raw = resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         body = ""

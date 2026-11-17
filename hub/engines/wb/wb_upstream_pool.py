@@ -358,6 +358,35 @@ def _resolve_ssl_factory():
     return ssl.create_default_context, ssl.create_default_context
 
 
+def _system_ca_pem():
+    """返回本机系统信任库的 PEM（macOS 钥匙串 + 系统证书文件）。
+
+    python.org 官方安装的 CPython 自带 CA bundle 会缺部分中间证书，访问
+    www.workbuddy.ai 等域名时报 CERTIFICATE_VERIFY_FAILED（self-signed
+    certificate in certificate chain），而 curl / 浏览器走 macOS 系统钥匙串
+    则正常。这里把系统信任库追加进来补全，失败一律返回空串回退默认 context。
+    """
+    parts = []
+    if platform.system() == "Darwin":
+        try:
+            out = subprocess.run(
+                ["security", "find-certificate", "-a", "-p",
+                 "/System/Library/Keychains/SystemRootCertificates.keychain"],
+                capture_output=True, text=True, timeout=10).stdout or ""
+            if out.strip():
+                parts.append(out)
+        except Exception:
+            pass
+    for path in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
+        try:
+            if os.path.isfile(path):
+                with open(path, "rb") as fh:
+                    parts.append(fh.read().decode("utf-8", "replace"))
+        except Exception:
+            pass
+    return "\n".join(p for p in parts if p.strip())
+
+
 def shared_ssl_context():
     """进程级共享的出站 TLS context（懒建，只建一次）。
 
@@ -390,6 +419,14 @@ def shared_ssl_context():
                     _SSL_CONTEXT.load_verify_locations(cafile=key[1])
                 else:
                     _SSL_CONTEXT = build()
+                # 补全 python.org CPython 自带 CA bundle 缺的中间证书：追加
+                # macOS 系统钥匙串 + /etc/ssl 信任库（仍 CERT_REQUIRED）。
+                _extra = _system_ca_pem()
+                if _extra:
+                    try:
+                        _SSL_CONTEXT.load_verify_locations(cadata=_extra)
+                    except Exception:
+                        pass
                 if key[2] == "node" and ident in _INITIAL_SSL_FACTORIES:
                     _apply_node_tls_profile(_SSL_CONTEXT)
                 _SSL_CONTEXT_KEY = key

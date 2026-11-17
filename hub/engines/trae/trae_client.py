@@ -38,7 +38,10 @@ import datetime
 import hashlib
 import json
 import os
+import platform
 import socket
+import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -363,6 +366,58 @@ def _hosts(account, realm, base="core"):
 # ---------------------------------------------------------------------------
 _OPENER_LOCK = threading.Lock()
 _OPENERS = {}
+_SSL_CONTEXT = None
+_SSL_LOCK = threading.Lock()
+
+
+def _system_ca_pem():
+    """返回本机系统信任库的 PEM（macOS 钥匙串 + 系统证书文件）。
+
+    python.org 官方安装的 CPython 自带 CA bundle 会缺部分中间证书，访问
+    trae-api-cn.mchost.guru 等上游时报 CERTIFICATE_VERIFY_FAILED，而 curl /
+    浏览器走 macOS 系统钥匙串则正常。这里把系统信任库追加进来补全。
+    失败一律返回空串，由调用方回退到默认 context。
+    """
+    parts = []
+    if platform.system() == "Darwin":
+        try:
+            out = subprocess.run(
+                ["security", "find-certificate", "-a", "-p",
+                 "/System/Library/Keychains/SystemRootCertificates.keychain"],
+                capture_output=True, text=True, timeout=10).stdout or ""
+            if out.strip():
+                parts.append(out)
+        except Exception:
+            pass
+    for path in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
+        try:
+            if os.path.isfile(path):
+                with open(path, "rb") as fh:
+                    parts.append(fh.read().decode("utf-8", "replace"))
+        except Exception:
+            pass
+    return "\n".join(p for p in parts if p.strip())
+
+
+def _ssl_context():
+    """进程级共享出站 SSL context：默认校验之上叠加系统信任库（懒建、只建一次）。
+
+    只补全证书链，**不放松校验**：verify_mode 仍为 CERT_REQUIRED、check_hostname
+    仍开启。
+    """
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        with _SSL_LOCK:
+            if _SSL_CONTEXT is None:
+                ctx = ssl.create_default_context()
+                extra = _system_ca_pem()
+                if extra:
+                    try:
+                        ctx.load_verify_locations(cadata=extra)
+                    except Exception:
+                        pass
+                _SSL_CONTEXT = ctx
+    return _SSL_CONTEXT
 
 
 def _proxy_map():
@@ -383,7 +438,10 @@ def _opener(proxy=None):
     with _OPENER_LOCK:
         opener = _OPENERS.get(key)
         if opener is None:
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler(dict(key)))
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler(dict(key)),
+                urllib.request.HTTPSHandler(context=_ssl_context()),
+            )
             _OPENERS[key] = opener
         return opener
 

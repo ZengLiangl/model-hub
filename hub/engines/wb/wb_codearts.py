@@ -19,8 +19,11 @@
 
 import json
 import os
+import platform
 import secrets
 import socket
+import ssl
+import subprocess
 import threading
 import time
 import urllib.error
@@ -873,7 +876,70 @@ def invalidate_pool(accounts_dir=None):
 
 _OPENER_CACHE = {}
 _OPENER_LOCK = threading.Lock()
-_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_SSL_CONTEXT = None
+_SSL_LOCK = threading.Lock()
+_DIRECT_OPENER = None
+
+
+def _system_ca_pem():
+    """返回本机系统信任库的 PEM（macOS 钥匙串 + 系统证书文件）。
+
+    python.org 官方安装的 CPython 自带 CA bundle 会缺部分中间证书（如华为云
+    侧的签发链），访问 sts/codearts 等域名时报 CERTIFICATE_VERIFY_FAILED，而
+    curl / 浏览器走 macOS 系统钥匙串则正常。这里把系统信任库追加进来补全。
+    失败一律返回空串，由调用方回退到默认 context。
+    """
+    parts = []
+    if platform.system() == "Darwin":
+        try:
+            out = subprocess.run(
+                ["security", "find-certificate", "-a", "-p",
+                 "/System/Library/Keychains/SystemRootCertificates.keychain"],
+                capture_output=True, text=True, timeout=10).stdout or ""
+            if out.strip():
+                parts.append(out)
+        except Exception:
+            pass
+    for path in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
+        try:
+            if os.path.isfile(path):
+                with open(path, "rb") as fh:
+                    parts.append(fh.read().decode("utf-8", "replace"))
+        except Exception:
+            pass
+    return "\n".join(p for p in parts if p.strip())
+
+
+def _ssl_context():
+    """进程级共享出站 SSL context：默认校验之上叠加系统信任库（懒建、只建一次）。
+
+    只补全证书链，**不放松校验**：verify_mode 仍为 CERT_REQUIRED、check_hostname
+    仍开启。
+    """
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        with _SSL_LOCK:
+            if _SSL_CONTEXT is None:
+                ctx = ssl.create_default_context()
+                extra = _system_ca_pem()
+                if extra:
+                    try:
+                        ctx.load_verify_locations(cadata=extra)
+                    except Exception:
+                        pass
+                _SSL_CONTEXT = ctx
+    return _SSL_CONTEXT
+
+
+def _direct_opener():
+    """直连 opener（忽略进程级 HTTP_PROXY），带系统信任库补全的 SSL context。"""
+    global _DIRECT_OPENER
+    if _DIRECT_OPENER is None:
+        _DIRECT_OPENER = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=_ssl_context()),
+        )
+    return _DIRECT_OPENER
 
 
 def _opener(proxy=""):
@@ -886,12 +952,13 @@ def _opener(proxy=""):
     """
     proxy = str(proxy or "").strip()
     if not proxy:
-        return _DIRECT_OPENER
+        return _direct_opener()
     with _OPENER_LOCK:
         opener = _OPENER_CACHE.get(proxy)
         if opener is None:
             opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=_ssl_context()),
             )
             _OPENER_CACHE[proxy] = opener
         return opener
