@@ -57,8 +57,10 @@ export async function login(password: string, engine: Engine = "wb"): Promise<Lo
       { dedupe: true, timeoutMs: 8000 },
     );
     if (r?.token) {
+      // 统一会话令牌三家共用：必须清掉历史遗留的逐引擎槽，否则 readToken 优先取
+      // 引擎槽，会拿旧令牌去请求，登录成功却处处 401。
+      for (const eng of ENGINES) writeToken("", eng);
       writeToken(r.token);
-      writeToken(r.token, "wb");
       return { ok: true, token: r.token, usingDefaultPassword: !!r.using_default_password };
     }
   } catch (err) {
@@ -288,6 +290,14 @@ export type MergedKey = { id?: string; name?: string; key?: string; enabled?: bo
 
 export const hubKeys = () => get<HubKeys>(API + "/hub/keys");
 
+/** 门户设置：统一登录口令是否仍为默认值（三家引擎共用这一套口令）。 */
+export type HubSettings = {
+  routing?: Record<string, unknown>;
+  merged_keys?: MergedKey[];
+  panel_password_default?: boolean;
+};
+export const hubSettings = () => get<HubSettings>(API + "/hub/settings");
+
 /** 保存合并 key：hub 端点认的是「面板口令」，不是引擎令牌，故按次覆盖 header。 */
 export const hubSaveKeys = (mergedKeys: MergedKey[], password: string) =>
   post<{ ok?: boolean }>(API + "/hub/settings/save", { merged_keys: mergedKeys }, { dedupe: true, token: password });
@@ -352,15 +362,14 @@ export type HubKeysDetail = {
 /** 详细 key 列表（含三家引擎各自的 key）。 */
 export const hubKeysDetail = () => get<HubKeysDetail>(API + "/hub/keys");
 
-/** 保存合并 key 表（整表替换，需要面板口令）。 */
 /**
- * 保存合并 key 表（整表替换，需要面板口令）。
- * 口令优先用调用方传的（UI 就地输入），否则用本会话记住的；都没有就明确报错。
+ * 保存合并 key 表（整表替换）。
+ * 口令优先用调用方传的（UI 就地输入），否则用本会话记住的；都没有则用门户会话令牌。
  */
 export async function hubSaveMerged(keys: MergedKeyRow[], password?: string): Promise<void> {
   const pw = (password ?? panelPassword).trim();
-  if (!pw) throw new ApiError("需要面板口令：请重新登录后再保存", { status: 401, kind: "unauthorized" });
-  await post(API + "/hub/settings/save", { merged_keys: keys }, { token: pw, dedupe: true });
+  // 没带口令时用当前门户会话令牌——后端两种都认，刷新页面后也能直接保存
+  await post(API + "/hub/settings/save", { merged_keys: keys }, pw ? { token: pw, dedupe: true } : { dedupe: true });
 }
 
 /** 网关自检（一次跑完所有判据）。 */
@@ -456,28 +465,18 @@ export const importPat = (eng: Engine, pat: string, realm?: string) =>
   post<{ ok?: boolean; error?: string }>(API + "/" + eng + "/accounts/import/pat",
     realm ? { pat: pat, realm: realm } : { pat: pat }, { timeoutMs: 60000 });
 
-/** 改面板密码：成功后**令牌会轮换**，必须把新令牌写回，否则当前会话立刻失效。 */
-export async function changePanelPassword(eng: Engine, current: string, next: string): Promise<void> {
-  // 统一登录后只改门户口令（一处生效，三家共用）；旧后端才退回引擎级修改
-  try {
-    await post<{ ok?: boolean }>(
-      API + "/hub/settings/save",
-      { panel_password: { current: current, new: next } },
-      { dedupe: true, token: current },
-    );
-    panelPassword = next;
-    return;
-  } catch (err) {
-    const status = (err as ApiError)?.status;
-    if (status !== 404 && status !== 405) throw err;
-  }
+/** 改面板密码：只改门户这一处，三家引擎共用；成功后令牌轮换，必须写回。 */
+export async function changePanelPassword(current: string, next: string): Promise<void> {
   const res = await post<{ ok?: boolean; token?: string }>(
-    API + "/" + eng + "/panel/password", { current: current, new: next }, { dedupe: true },
+    API + "/hub/settings/save",
+    { panel_password: { current: current, new: next } },
+    { dedupe: true, token: current },
   );
+  panelPassword = next;
   if (res?.token) {
-    writeToken(res.token, eng);
+    // 统一会话令牌：先清逐引擎槽，否则历史遗留的引擎令牌会盖住新的主令牌
+    for (const eng of ENGINES) writeToken("", eng);
     writeToken(res.token);
-    panelPassword = next;
   }
 }
 
@@ -589,9 +588,12 @@ export const frameCheck = (url: string) =>
 export const revealEngineKey = (eng: Engine, id: string) =>
   get<{ id?: string; key?: string }>(API + "/" + eng + "/settings/reveal", { query: { id: id } });
 
-/** 取回合并 Key 的明文 —— 需要面板口令本体（和 settings/save 同一套授权）。 */
-export const revealMergedKey = (id: string, password: string) =>
-  get<{ id?: string; key?: string }>(API + "/hub/keys/reveal", { query: { id: id }, token: password });
+/** 取回合并 Key 的明文 —— 用门户会话令牌授权（不再单独要面板口令）。 */
+export const revealMergedKey = (id: string, password?: string) =>
+  get<{ id?: string; key?: string }>(
+    API + "/hub/keys/reveal",
+    password ? { query: { id: id }, token: password } : { query: { id: id } },
+  );
 
 /**
  * 用一把**明文 key** 真打一次 /v1/models。

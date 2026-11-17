@@ -142,6 +142,12 @@ def _hub_session_ok(token):
             return False
         return True
 
+
+def _hub_sessions_clear():
+    """口令变更后作废所有会话：否则旧密码登录的标签页还能继续用。"""
+    with _HUB_SESSIONS_LOCK:
+        _HUB_SESSIONS.clear()
+
 #: 显式 MIME 表。.js 必须是 text/javascript —— 模块脚本对 MIME 敏感。
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -625,7 +631,7 @@ class PortalHandler(BaseHTTPRequestHandler):
             # 与 settings/save 同一套授权 —— 必须带面板口令（X-Panel-Token 里放口令本体），
             # 引擎令牌不够：那是引擎的，不是融合层的。
             supplied = (self.headers.get("X-Panel-Token") or "").strip()
-            if not settings.verify_panel_password(supplied):
+            if not (settings.verify_panel_password(supplied) or _hub_session_ok(supplied)):
                 return self._json(401, {"error": "panel password required"})
             wanted = (params.get("id") or [""])[0]
             for entry in settings.merged_keys(masked=False):
@@ -1025,7 +1031,9 @@ class PortalHandler(BaseHTTPRequestHandler):
           panel_password    {current, new} 修改 hub 面板口令
         """
         token = (self.headers.get("X-Panel-Token") or "").strip()
-        if not settings.verify_panel_password(token):
+        # 统一登录：门户会话令牌和口令本体都认。前端登录后手里只有会话令牌，
+        # 不能再要求它保存明文口令才能改配置。
+        if not (settings.verify_panel_password(token) or _hub_session_ok(token)):
             return self._json(401, {"error": "hub panel password required",
                                     "hint": "X-Panel-Token: admin（默认口令）"})
         payload = self._read_body()
@@ -1049,6 +1057,9 @@ class PortalHandler(BaseHTTPRequestHandler):
                 ok, message = settings.set_panel_password(current, new)
                 if not ok:
                     return self._json(400, {"error": message})
+                # 口令已变：旧会话全部作废，只给当前这次请求换发新令牌
+                _hub_sessions_clear()
+                reply["token"] = _hub_session_new()
                 reply["panel_password"] = "changed"
         except ValueError as exc:
             return self._json(400, {"error": str(exc)})

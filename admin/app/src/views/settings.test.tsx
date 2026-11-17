@@ -56,7 +56,9 @@ beforeEach(() => {
 
 describe('SettingsView', () => {
   it('加载中显示骨架；切引擎按新作用域重新取设置', async () => {
-    mockFetch(() => json(SETTINGS));
+    mockFetch((url) => url.includes('/api/hub/settings')
+      ? json({ panel_password_default: true })
+      : json(SETTINGS));
     renderView();
     expect(document.querySelectorAll('.animate-pulse').length).toBeGreaterThan(0);
 
@@ -66,7 +68,9 @@ describe('SettingsView', () => {
   });
 
   it('渲染面板状态（默认密码警告）与限额数字；Key 内容已全部移出', async () => {
-  mockFetch(() => json(SETTINGS));
+  mockFetch((url) => url.includes('/api/hub/settings')
+    ? json({ panel_password_default: true })
+    : json(SETTINGS));
   renderView();
 
   // 默认密码 → 顶部警告条（auth.defaultHint）

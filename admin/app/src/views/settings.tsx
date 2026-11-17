@@ -8,7 +8,7 @@ import { useLang } from '@/lib/i18n';
 import { settingLabel } from '@/lib/setting-labels';
 import { UpdateCard } from '@/components/app/update';
 import {
-  ENGINE_LABELS, ENGINES, changePanelPassword, getPanelPassword, engineSchedulerToggle, engineSettings, hubKeysDetail, hubSaveMerged,
+  ENGINE_LABELS, ENGINES, changePanelPassword, engineSchedulerToggle, engineSettings, hubKeysDetail, hubSaveMerged, hubSettings,
   hubScheduler, hubSelfcheck, pricingRefresh, pricingState, proxyDiscover, proxySlotTest, proxySlots, proxySlotsSave,
   probeKey, revealEngineKey, revealMergedKey, saveSettings,
   type ApiKey, type Engine, type SettingsPayload,
@@ -109,6 +109,8 @@ export default function SettingsView() {
 
   const queryKey = ["settings", engine] as const;
   const settings = useQuery({ queryKey, queryFn: () => engineSettings(engine) });
+  // 登录密码已统一到门户一层：默认密码状态只看门户设置，不再按引擎各看一套。
+  const portal = useQuery({ queryKey: ["hub-settings"], queryFn: hubSettings });
 
   const saved = minutesOf(settings.data);
 
@@ -145,7 +147,7 @@ export default function SettingsView() {
   const unauthorized = authError?.status === 401;
 
   const limits = parseLimits(settings.data?.limits);
-  const isDefaultPwd = settings.data?.panel_password_is_default === true;
+  const isDefaultPwd = portal.data?.panel_password_default === true;
   const authRequired = settings.data?.auth_required === true;
   const masked = String(settings.data?.api_key_masked ?? "");
 
@@ -235,7 +237,7 @@ export default function SettingsView() {
 
             <dl className="grid gap-2 sm:grid-cols-3">
               <div className="flex flex-col gap-1 rounded-md border border-line bg-surface-2/40 px-3 py-2">
-                <dt className="text-[11px] text-fg-mute">{t("auth.password") + " · " + t("engine.default")}</dt>
+                <dt className="text-[11px] text-fg-mute">{t("auth.unifiedPassword") + " · " + t("engine.default")}</dt>
                 <dd className="flex min-w-0 items-center gap-2 text-sm">
                   <Badge tone={isDefaultPwd ? "warn" : "ok"}>
                     {isDefaultPwd ? t("common.yes") : t("common.no")}
@@ -585,17 +587,13 @@ export function HubPanels({ t, only }: { t: (k: string, v?: Record<string, strin
   const [scopeModels, setScopeModels] = useState('');
   const [scopeEngines, setScopeEngines] = useState('');
   const [confirmId, setConfirmId] = useState<string | null>(null);
-  /** 刷新页面后内存口令会丢：保存前如果为空，就地要一次（比直接报错友好） */
-  const [pw, setPw] = useState('');
   const [revealedMerged, setRevealedMerged] = useState<{ id: string; key: string } | null>(null);
   /** 每把合并 key 的实测结果：ok / bad，未测则无键 */
   const [probe, setProbe] = useState<Record<string, { ok: boolean; status: number; detail: string }>>({});
 
   async function testMerged(id: string) {
-    const password = needPw ? pw : getPanelPassword();
-    if (!password) { toast.push('warn', t('settings.keyRevealNeedPw')); return; }
     try {
-      const res = await revealMergedKey(id, password);
+      const res = await revealMergedKey(id);
       const key = String(res?.key || '');
       if (!key) throw new Error(t('settings.keyRevealFailed'));
       const out = await probeKey(key);
@@ -605,16 +603,13 @@ export function HubPanels({ t, only }: { t: (k: string, v?: Record<string, strin
       toast.push('err', (e as Error).message || t('settings.keyRevealFailed'));
     }
   }
-  const needPw = !getPanelPassword();
 
   const merged = keys.data?.merged ?? [];
 
-  /** 合并 Key 的明文只在融合层存着：取回要面板口令（和保存同一套授权） */
+  /** 合并 Key 的明文只在融合层存着：用门户会话令牌取回 */
   async function copyMerged(id: string) {
-    const password = needPw ? pw : getPanelPassword();
-    if (!password) { toast.push('warn', t('settings.keyRevealNeedPw')); return; }
     try {
-      const res = await revealMergedKey(id, password);
+      const res = await revealMergedKey(id);
       const key = String(res?.key || '');
       if (!key) throw new Error(t('settings.keyRevealFailed'));
       setRevealedMerged({ id: id, key: key });
@@ -630,7 +625,7 @@ export function HubPanels({ t, only }: { t: (k: string, v?: Record<string, strin
   }
 
   const save = useMutation({
-    mutationFn: function (next: typeof merged) { return hubSaveMerged(next, needPw ? pw : undefined); },
+    mutationFn: function (next: typeof merged) { return hubSaveMerged(next); },
     onSuccess: function () {
       toast.push('ok', t('common.saved'));
       setName(''); setSecret(''); setConfirmId(null);
@@ -761,15 +756,7 @@ export function HubPanels({ t, only }: { t: (k: string, v?: Record<string, strin
             {t("common.add")}
           </Button>
         </div>
-        {needPw ? (
-          <div className="mt-2 max-w-[240px]">
-            <Field label={t("auth.password")} hint={t("settings.keyRevealHint")}>
-              {(p) => <Input {...p} type="password" autoComplete="current-password" value={pw} onChange={function (e) { setPw(e.target.value); }} />}
-            </Field>
-          </div>
-        ) : (
-          <p className="mt-2 text-[11px] text-fg-mute">{t("settings.keyRevealHint")}</p>
-        )}
+        <p className="mt-2 text-[11px] text-fg-mute">{t("settings.keyRevealHint")}</p>
       </Card>
       )}
       {only === "keys" ? null : (
@@ -834,22 +821,24 @@ export function HubPanels({ t, only }: { t: (k: string, v?: Record<string, strin
   );
 }
 
-/** 改面板密码：成功后服务端会轮换令牌，api 层负责把新令牌写回，否则当前会话立刻失效。 */
+/** 统一登录密码：只改门户这一处，三家引擎共用；成功后令牌轮换，必须写回。 */
 function PasswordCard({ t }: { t: (k: string, v?: Record<string, string | number>) => string }) {
   const [cur, setCur] = useState('');
   const [next, setNext] = useState('');
   const [err, setErr] = useState<string | null>(null);
   const toast = useToast();
+  const qc = useQueryClient();
   const save = useMutation({
-    mutationFn: function () { return changePanelPassword("wb", cur, next); },
+    mutationFn: function () { return changePanelPassword(cur, next); },
     onSuccess: function () {
       toast.push('ok', t('common.saved'));
       setCur(''); setNext(''); setErr(null);
+      void qc.invalidateQueries({ queryKey: ['hub-settings'] });
     },
     onError: function (e) { setErr((e as Error).message); },
   });
   return (
-    <Card title={t("auth.password")} subtitle={t("settings.limitsHint")}>
+    <Card title={t("auth.unifiedPassword")} subtitle={t("settings.unifiedPasswordHint")}>
       <form
         className="flex flex-wrap items-end gap-2"
         onSubmit={function (e) { e.preventDefault(); if (!cur || !next) return; save.mutate(); }}
