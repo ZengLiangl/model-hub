@@ -439,6 +439,9 @@ export const zh = {
   'overview.kpi.cost': '估算价格',
   'overview.kpi.errors': '失败请求',
   'overview.kpi.noPricing': '未取价',
+  // 错误卡副标题：原来复用了空态文案（"错误流水只在失败时才有内容"），
+  // 于是下面明明列着几条错误，上面还写着"只在失败时才有内容"。
+  'overview.errors.subtitle': '最近 {n} 条失败；空表 = 这段时间没有失败',
   'overview.recent.title': '最近流水',
   'overview.credit.title': '积分',
   'overview.credit.sub': '按引擎与区域分开统计 —— 一个总数会把「某台已经见底」压成「还有剩余」',
@@ -1304,6 +1307,7 @@ export const en: Record<string, string> = {
   'overview.kpi.cost': 'Est. cost',
   'overview.kpi.errors': 'Errors',
   'overview.kpi.noPricing': 'no pricing',
+  'overview.errors.subtitle': 'Latest {n} failures; an empty list means none recently',
   'overview.recent.title': 'Recent traffic',
   'overview.credit.title': 'Credits',
   'overview.credit.sub': 'Split by engine and realm — a single total hides an engine running dry',

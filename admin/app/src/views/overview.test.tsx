@@ -75,4 +75,28 @@ describe('OverviewView 三态', () => {
     const status = screen.getAllByRole("status").map((n) => n.textContent || "").join(" ");
     expect(status).toMatch(/Qoder/);
   });
+
+  // 回归守卫：错误卡的副标题曾经复用了**空态**那句文案（logs.errorEmpty.desc），
+  // 结果下面明明列着几条错误，卡片头上还写着「错误流水只在失败时才有内容」。
+  it('错误卡副标题随实际条数走，不冒充空态文案', async () => {
+    mockFetch((url) => {
+      if (url.includes("/health")) return json({ ok: true, engines: {} });
+      if (url.includes("/wb/logs")) return json({ logs: [
+        { ts: "2026-11-17T22:04:27", level: "error", msg: "request error: status=503 no usable account" },
+        { ts: "2026-11-17T22:04:28", level: "error", msg: "models.dev refresh skipped" },
+        { ts: "2026-11-17T22:04:29", level: "info", msg: "ok line" },
+      ] });
+      if (url.includes("/logs")) return json({ logs: [] });
+      if (url.includes("/usage")) return json({ requests: 10, errors: 2, total_tokens: 1 });
+      return json({});
+    });
+    renderView();
+    await waitFor(() => expect(screen.getByText(/no usable account/)).toBeInTheDocument());
+    const errCard = screen.getByText(/no usable account/).closest("[class*=rounded-lg]") as HTMLElement | null;
+    const sub = document.body.textContent || "";
+    // jsdom 的语言跟随运行环境，断言不绑语言：中英两版都要能过。
+    expect(sub).toMatch(/(最近 2 条失败|Latest 2 failures)/);
+    expect(sub).not.toMatch(/(错误流水只在失败时才有内容|This tab only fills up on failures)/);
+    expect(errCard).toBeTruthy();
+  });
 });

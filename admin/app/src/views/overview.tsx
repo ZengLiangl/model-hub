@@ -213,7 +213,7 @@ export default function OverviewView() {
           <BarChart data={byModel} maxRows={6} formatValue={fmt} ariaLabel={t('metrics.byModel')} />
         </Card>
 
-        <Card title={t('logs.tab.errors')} subtitle={t('logs.errorEmpty.desc')}>
+        <Card title={t('logs.tab.errors')} subtitle={t('overview.errors.subtitle', { n: recentErrors.length })}>
           {recentErrors.length === 0 ? (
             <p className="py-6 text-center text-[11.5px] text-fg-mute">{t('logs.errorEmpty.title')}</p>
           ) : (

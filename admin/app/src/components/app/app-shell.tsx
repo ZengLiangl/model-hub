@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
 
 const LOGO = (import.meta.env.BASE_URL || './') + 'logo.jpg';
 import { ChevronLeft, Menu, Moon, PanelLeft, Sun, X } from 'lucide-react';
 import { useLang } from '@/lib/i18n';
+import { hubHealth } from '@/lib/api';
 import { UpdateBanner } from '@/components/app/update';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/cn';
@@ -49,6 +51,12 @@ export function AppShell() {
   });
   const location = useLocation();
   const navigate = useNavigate();
+
+  /** 版本号取自后端 /api/hub/health（与总览同一份缓存），不再写死在源码里。
+   *  之前这里硬编码 "v1.0.0"，后端已经是 1.1.0，面板自己先把版本说错了。
+   *  取不到就只显示「喵枢」——宁可少一个版本号，也不显示一个错的。 */
+  const health = useQuery({ queryKey: ['hub-health'], queryFn: hubHealth });
+  const version = health.data?.version ? ' · v' + health.data.version : '';
 
   const current = ROUTES.find(function (r) { return location.pathname.startsWith(r.path); }) ?? ROUTES[0];
   const title = t(current.labelKey);
@@ -109,7 +117,9 @@ export function AppShell() {
               <p className="truncate text-[12px] font-semibold leading-4 tracking-tight" title={t('app.name')}>
                 {t('app.name')}
               </p>
-              <p className="truncate text-[10px] leading-4 text-fg-mute">{t('app.short')} · v1.0.0</p>
+              <p className="truncate text-[10px] leading-4 text-fg-mute" title={t('app.name')}>
+                {t('app.short')}{version}
+              </p>
             </div>
             <button
               onClick={function () { setOpen(false); }}

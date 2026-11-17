@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { LangProvider } from '@/lib/i18n';
 import { ToastProvider } from '@/components/ui';
+import { queryClient } from '@/lib/query';
 import App from '@/App';
 
 function renderApp() {
@@ -30,6 +31,10 @@ beforeEach(() => {
   sessionStorage.clear();
   localStorage.clear();
   window.location.hash = "";
+  // ★ 真 App 用的是模块级 queryClient（staleTime 15s），不是本文件里那个
+  //   QueryClientProvider —— 不清缓存的话，后一个用例会直接读到前一个用例
+  //   缓存的 /api/hub/health（比如没有 version 的那份），测什么都是假的。
+  queryClient.clear();
 });
 
 describe('AuthGate', () => {
@@ -81,6 +86,26 @@ describe('AppShell', () => {
   });
 
   // 胶囊三档：<1024 汉堡 / 1024–1151 FAB / >=1152 完整胶囊
+  // 回归守卫：侧边栏版本号曾经是源码里的硬编码 "v1.0.0"，后端早已 1.1.0 ——
+  // 面板自己先把版本说错了。现在取 /api/hub/health 的 version。
+  it('侧边栏版本号来自后端 health.version（不是硬编码）', async () => {
+    sessionStorage.setItem('hub-panel-token', 'tk');
+    mockFetch((url) => (url.includes('/health')
+      ? json({ ok: true, version: '9.9.9', engines: {} })
+      : json({})));
+    renderApp();
+    await waitFor(() => expect(document.body.textContent || '').toMatch(/v9\.9\.9/), { timeout: 5000 });
+    expect(document.body.textContent || '').not.toMatch(/v1\.0\.0/);
+  });
+
+  it('健康接口没给 version 时只显示「喵枢」，不显示错的版本号', async () => {
+    sessionStorage.setItem('hub-panel-token', 'tk');
+    mockFetch((url) => (url.includes('/health') ? json({ ok: true, engines: {} }) : json({})));
+    renderApp();
+    await waitFor(() => expect(document.querySelector('aside.nav-pill')).toBeTruthy(), { timeout: 5000 });
+    expect(document.body.textContent || '').not.toMatch(/v1\.0\.0/);
+  });
+
   it('胶囊三档：宽屏显示完整胶囊，不显示 FAB', async () => {
     sessionStorage.setItem('hub-panel-token', 'tk');
     mockFetch((url) => (url.includes('/health') ? json({ ok: true, engines: {} }) : json({})));
