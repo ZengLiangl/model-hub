@@ -10817,11 +10817,19 @@ class Handler(BaseHTTPRequestHandler):
                 })
             report = POOL.import_rows(rows, realm=forced_realm,
                                       overwrite=overwrite)
+            # trae 的 import_rows 返回计数（imported/updated/skipped/errors），
+            # 不是 wb/qd 的列表形态；同时给前端补顶层计数，否则提示永远是 0。
+            added = report.get("imported", 0)
+            invalid = len(report.get("errors") or [])
             log("account import: %d added, %d updated, %d skipped, %d invalid"
-                % (len(report["added"]), len(report["updated"]),
-                   len(report["skipped"]), len(report["invalid"])))
+                % (added, report.get("updated", 0),
+                   report.get("skipped", 0), invalid))
             return self._json(200, {
                 "count": len(rows),
+                "added": added,
+                "updated": report.get("updated", 0),
+                "skipped": report.get("skipped", 0),
+                "invalid": invalid,
                 "result": report,
                 "accounts": account_views(),
             })
