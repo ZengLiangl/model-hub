@@ -9486,7 +9486,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "not found")
 
     def _admin_test_account(self, account):
-        model = "Doubao-1.5-pro" if acc_realm(account) == "cn" else "gpt-4o"
+        model = "seed_m8" if acc_realm(account) == "cn" else "gpt-4o"
         started = time.time()
         try:
             response, used, _ = open_upstream({"model": model, "max_tokens": 32,
@@ -10712,7 +10712,10 @@ class Handler(BaseHTTPRequestHandler):
             if str(test_model).strip().lower() == "auto":
                 # `/accounts/test` uses the raw_chat upstream; `auto` is not a
                 # raw model and always returns upstream 400. Pick a real model.
-                test_model = "Doubao-1.5-pro" if acc_realm(account) == "cn" else "gpt-4o"
+                # CN 必须用 model_list 返回的真实 name：seed_m8 是默认模型
+                # 「Doubao-1.5-pro」的上游 key；display_name/旧 catalog 名会
+                # 触发上游 4023 model unknown / 502。
+                test_model = "seed_m8" if acc_realm(account) == "cn" else "gpt-4o"
             test_payload = {
                 "model": test_model,
                 "messages": [{"role": "user", "content": "hi"}],
@@ -10761,12 +10764,21 @@ class Handler(BaseHTTPRequestHandler):
                                         "elapsed_ms": wall_ms})
             except Exception as exc:
                 wall_ms = int((time.time() - t0) * 1000)
-                account.note_error(str(exc)[:80], cooldown=60)
+                message = str(exc)
+                # 选号失败（"no usable account"）不是被测试账号本身的错，而是
+                # 账号池里此刻没有可用号（例如该账号正冷却、被选号逻辑跳过）。
+                # 若把它 note_error 到该账号，会形成「冷却→跳过→再冷却」死循环，
+                # 故这里只回报、不记错、不冻结。
+                if not message.startswith("no usable account"):
+                    account.note_error(message[:80], cooldown=60)
+                    status = 500
+                else:
+                    status = 503
                 log("account test: uid=%s model=%s wall=%dms exc=%s"
                     % (account.uid[:8], test_model, wall_ms, exc),
                     level="WARN", tag="accounts")
                 return self._json(200, {"ok": False, "uid": account.uid,
-                                        "status": 500, "error": str(exc),
+                                        "status": status, "error": message,
                                         "elapsed_ms": wall_ms})
         if path == "/accounts/set":
             uid = payload.get("uid")

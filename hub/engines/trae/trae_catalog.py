@@ -930,6 +930,12 @@ def _account_key(account):
             value = account.get(field)
             if value:
                 return str(value)
+    # POOL.pick 返回 Account 对象而非 dict：用属性兜底提取 uid，避免缓存键
+    # 退化成空串、与「无账号」的 snapshot 回退缓存共用同一把键。
+    for field in ("uid", "userId", "user_id", "email"):
+        value = getattr(account, field, None)
+        if value:
+            return str(value)
     return ""
 
 
