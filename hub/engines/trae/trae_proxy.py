@@ -10378,10 +10378,19 @@ class Handler(BaseHTTPRequestHandler):
             account = next((a for a in getattr(POOL, "accounts", []) if getattr(a, "realm", "") == "cn"), None)
         if not account:
             return self._error(503, "no CN account available", "server_error")
+        fp = prompt_fingerprint(payload.get("messages"))
+        t_start = time.time()
         try:
             result = trae_solo_chat(account, {**payload, "model": model})
         except Exception as exc:
+            record_error(model, 502, str(exc),
+                         elapsed_ms=int((time.time() - t_start) * 1000))
             return self._error(502, "Trae SOLO upstream failed: %s" % exc, "upstream_error")
+        # 落盘记账：SOLO 通道此前只把 usage 拼进响应返回，从不写 usage.jsonl，
+        # 导致 /metrics 的 requests/tokens 恒为 0（日志里只有 record_error 的失败行）。
+        record_usage(model, result.get("usage") or {}, stream=bool(payload.get("stream")),
+                     elapsed_ms=int((time.time() - t_start) * 1000),
+                     fp=fp, account=account.uid, key_id=self._key_id_for_usage())
         tool_calls = result.get("tool_calls") or []
         if payload.get("stream"):
             self._sse_begin()
