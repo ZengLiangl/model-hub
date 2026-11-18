@@ -10607,9 +10607,16 @@ class Handler(BaseHTTPRequestHandler):
             target_realm = payload.get("realm") or CURRENT_REALM
             if target_realm not in ("intl", "cn"):
                 target_realm = "cn"
+            # 回调地址跟随面板访问来源：局域网打开面板时回调也要回到本机的局域网 IP，
+            # 否则浏览器会去连它自己的 127.0.0.1。门户反代会带 X-Forwarded-Host。
+            _raw_host = (self.headers.get("X-Forwarded-Host")
+                         or self.headers.get("Host") or "").strip()
+            _raw_host = _raw_host.split(",")[0].strip()
+            cb_host = urllib.parse.urlsplit("//" + _raw_host).hostname or "127.0.0.1"
             try:
                 started = POOL.start_login(realm=target_realm,
-                                           platform=platform)
+                                           platform=platform,
+                                           callback_host=cb_host)
             except Exception as exc:
                 return self._error(502, "could not start login: %s" % exc)
             # Trae 没有设备授权流程：明确回 501，而不是继续读 state 抛 KeyError

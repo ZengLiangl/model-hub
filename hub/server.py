@@ -476,6 +476,10 @@ def main(argv=None):
 
     ok = True
     hub_health = None
+    # 健康探测必须走回环：本机可能配了系统 HTTP 代理（macOS urllib 会读系统代理，
+    # 且代理例外里通常没有 0.0.0.0），探测 0.0.0.0 会被代理吞成空响应，
+    # 导致 LAN 模式下自我健康检查误判、进程反复重启。
+    probe_host = "127.0.0.1" if args.host in ("0.0.0.0", "", None) else args.host
     # 第 232 轮：记录真正起来的引擎 —— 一家起不来不该让**整站**不启动。
     # 面板本身已经能表达"某家没数据"（partialNotice/降级横幅），
     # 所以只要还有一家活着，就把面板起出来让用户看见谁挂了、怎么救。
@@ -487,7 +491,7 @@ def main(argv=None):
             print("        (stop it, or pass --%s-port <free port>)" % name)
             continue
         thread = start_engine(name, args.host, port, extra)
-        health = wait_health(port, args.host, expect=name)
+        health = wait_health(port, probe_host, expect=name)
         # 线程存活 = 我们的引擎真起来了（绑失败会 SystemExit → 线程结束）；
         # 端口空闲预检后，第一个应答者必然是我们的引擎，双保险。
         if health is None or not thread.is_alive():
@@ -511,7 +515,7 @@ def main(argv=None):
         for name, port, _extra in plan:
             engine_ports[name] = port
         start_portal(args.host, args.portal_port, engine_ports, paths.admin_dir())
-        hub_health = wait_portal(args.host, args.portal_port)
+        hub_health = wait_portal(probe_host, args.portal_port)
         if hub_health is None:
             ok = False
             print("  [%s] portal did NOT answer /api/hub/health on :%d" % (HUB_NAME, args.portal_port))

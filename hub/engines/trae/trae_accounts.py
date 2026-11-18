@@ -113,6 +113,30 @@ _OAUTH_LOCK = threading.Lock()
 _OAUTH_SSL_CONTEXT = None
 _OAUTH_SSL_LOCK = threading.Lock()
 
+#: 回调 host 参数只允许这些域（官方登录网关），其余忽略，避免被当成任意出站地址。
+_OAUTH_HOST_DOMAINS = (".trae.ai", ".trae.cn", ".traeapi.us")
+
+
+def _callback_host_override(params):
+    """从授权回跳的 host 参数得到兑换基址（https://网关域），不合法返回空串。
+
+    官方客户端的 ExchangeToken 基址来自登录回跳的 host：国际版账号可能落在
+    ug-normal.us.trae.ai，而配置里的 api.trae.ai 对该接口直接 404。
+    """
+    raw = str((params or {}).get("host") or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        hostname = (parsed.hostname or "").lower()
+    except ValueError:
+        return ""
+    if parsed.scheme != "https" or not hostname:
+        return ""
+    if not any(hostname.endswith(d) for d in _OAUTH_HOST_DOMAINS):
+        return ""
+    return "https://%s" % parsed.netloc
+
 
 def _b64url(raw):
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -2051,6 +2075,7 @@ class _OAuthLoginSession(object):
         self.error = ""
         self.account_view = None
         self.auth_url = ""
+        self.realm_host_override = ""
         self.server = None
         self.thread = None
         self.timer = None
@@ -2061,12 +2086,15 @@ class _OAuthLoginSession(object):
         self.ide_version = _oauth_ide_version(realm)
 
     # -- 生命周期 --------------------------------------------------------
-    def prepare(self):
+    def prepare(self, callback_host=None):
+        # 绑定 0.0.0.0：局域网设备完成授权时浏览器需要能回跳到本机端口；
+        # 127.0.0.1 同时也覆盖（0.0.0.0 是通配绑定）。
         self.server = http.server.ThreadingHTTPServer(
-            ("127.0.0.1", 0), _OAuthCallbackHandler)
+            ("0.0.0.0", 0), _OAuthCallbackHandler)
         self.server.daemon_threads = True
         self.server.oauth_session = self
         port = self.server.server_address[1]
+        cb_host = str(callback_host or "").strip() or "127.0.0.1"
         cfg = OAUTH_REALMS[self.realm]
         params = {
             "login_version": "1",
@@ -2077,7 +2105,7 @@ class _OAuthLoginSession(object):
             "client_id": cfg["client_id"],
             "redirect": "0",
             "login_trace_id": self.state,
-            "auth_callback_url": "http://127.0.0.1:%d%s" % (port, OAUTH_CALLBACK_PATH),
+            "auth_callback_url": "http://%s:%d%s" % (cb_host, port, OAUTH_CALLBACK_PATH),
             "machine_id": self.machine_id,
             "device_id": self.device_id,
             "code_challenge": self.challenge,
@@ -2162,6 +2190,9 @@ class _OAuthLoginSession(object):
         auth_code = self._auth_code(params)
         if not auth_code:
             raise RuntimeError("回调里没有 authCode（授权可能被取消）")
+        # 官方客户端用登录回跳里的 host 作为兑换基址：国际版账号（USTTP 等）
+        # 落在 ug-normal.us.trae.ai 这类网关，api.trae.ai 对该接口直接 404。
+        self.realm_host_override = _callback_host_override(params)
         self.status = "exchanging"
         self.message = "正在用授权码换取 Token…"
         exchanged = self._exchange(auth_code)
@@ -2200,7 +2231,11 @@ class _OAuthLoginSession(object):
 
     def _hosts(self):
         cfg = OAUTH_REALMS[self.realm]
-        hosts = [cfg["api_host"]]
+        hosts = []
+        if self.realm_host_override and self.realm_host_override not in hosts:
+            hosts.append(self.realm_host_override)
+        if cfg["api_host"] not in hosts:
+            hosts.append(cfg["api_host"])
         fallback = (REALMS.get(self.realm) or {}).get("account")
         if fallback and fallback not in hosts:
             hosts.append(fallback)
@@ -2904,14 +2939,14 @@ class AccountPool(object):
         return dict(account.public(), uidSynthetic=bool(derived_uid), created=True)
 
     # -- 浏览器授权登录（loopback + PKCE，与官方客户端同款流程）----------
-    def start_login(self, realm=None, platform=None):
+    def start_login(self, realm=None, platform=None, callback_host=None):
         realm = realm_key(realm) or DEFAULT_REALM
         if realm not in OAUTH_REALMS:
             return {"status": "error", "realm": realm,
                     "message": "不支持的区域：%s" % realm}
         session = _OAuthLoginSession(self, realm, platform=platform)
         try:
-            session.prepare()
+            session.prepare(callback_host=callback_host)
         except Exception as exc:
             return {"status": "error", "realm": realm,
                     "message": "无法启动本地回调服务：%s"
