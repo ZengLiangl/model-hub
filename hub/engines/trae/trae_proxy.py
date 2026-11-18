@@ -110,6 +110,37 @@ SOLO_AGENT_MODELS = {
     "Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Turbo", "Doubao-Seed-Evolving",
     "step-5-preview",
 } | set(SOLO_MODEL_ALIASES)
+
+#: 大小写无关的 SOLO 模型表。合并清单会把 id 统一小写（如 deepseek-v4-pro），
+#: 而 SOLO 表里是官方显示名/上游真名；不做归一就会漏到 raw_chat 触发 4023。
+_SOLO_MODEL_LOWER = {}
+for _name in SOLO_AGENT_MODELS:
+    _key = str(_name).strip()
+    if _key:
+        _SOLO_MODEL_LOWER.setdefault(_key.lower(), _key)
+for _alias, _target in SOLO_MODEL_ALIASES.items():
+    _SOLO_MODEL_LOWER[str(_alias).strip().lower()] = _target
+
+
+def solo_model_key(model):
+    """客户端模型名 -> SOLO 通道的 config_name；不是 SOLO 模型返回 ""。
+
+    客户端拿到的是 /v1/models 的 id（可能是官方显示名，也可能被合并清单
+    统一成小写），这里先做大小写无关匹配、别名映射，再用目录解析兜底。
+    """
+    raw = str(model or "").strip()
+    if not raw:
+        return ""
+    hit = _SOLO_MODEL_LOWER.get(raw.lower())
+    if hit:
+        return hit
+    try:
+        key = trae_catalog.resolve_upstream_key(raw, realm="cn")
+    except Exception:
+        key = raw
+    return _SOLO_MODEL_LOWER.get(str(key or "").strip().lower(), "")
+
+
 CURRENT_REALM = os.environ.get("TRAE_PROXY_DEFAULT_REALM", "cn")
 
 
@@ -10340,7 +10371,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "not found", "invalid_request_error")
 
     def _handle_agent_solo(self, payload):
-        model = str(payload.get("model") or "deepseek-v4.1-flash")
+        requested_model = str(payload.get("model") or "deepseek-v4.1-flash")
+        model = solo_model_key(requested_model) or requested_model
         account = POOL.pick(realm="cn")
         if not account:
             account = next((a for a in getattr(POOL, "accounts", []) if getattr(a, "realm", "") == "cn"), None)
@@ -10361,10 +10393,10 @@ class Handler(BaseHTTPRequestHandler):
                      "function": {"name": call["function"]["name"],
                                   "arguments": call["function"]["arguments"]}}
                     for i, call in enumerate(tool_calls)]
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
+            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": requested_model,
                      "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
             self._sse_write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
-            done = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
+            done = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": requested_model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": result["finish_reason"]}]}
             self._sse_write(("data: " + json.dumps(done, ensure_ascii=False) + "\n\n").encode("utf-8"))
             self._sse_write(b"data: [DONE]\n\n")
@@ -10382,7 +10414,7 @@ class Handler(BaseHTTPRequestHandler):
             "id": "chatcmpl-" + uuid.uuid4().hex,
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": model,
+            "model": requested_model,
             "choices": [{"index": 0, "message": message, "finish_reason": result["finish_reason"]}],
             "usage": result["usage"] or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
@@ -11438,7 +11470,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_anthropic(path, payload)
 
         # ---- Chat Completions 主链路 ----
-        if str(payload.get("model") or "") in SOLO_AGENT_MODELS:
+        # 合并清单的 id 是小写，SOLO 表里是官方名/上游真名 —— 必须归一后再判，
+        # 否则 DeepSeek-V4-Pro 这类显示名/小写名会漏到 raw_chat 并返回 4023。
+        if solo_model_key(payload.get("model")):
             return self._handle_agent_solo(payload)
         normalize_tool_choice(payload)
         normalize_tools(payload)
