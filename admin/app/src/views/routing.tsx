@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { hubRouting, hubRoutingSave, hubRoutePreview } from '@/lib/api';
-import type { RouteRule, RoutingDoc } from '@/lib/api';
+import { hubRouting, hubRoutingSave, hubRoutePreview, ENGINE_LABELS } from '@/lib/api';
+import { useLang } from '@/lib/i18n';
+import type { RouteRule, RoutingDoc, Engine } from '@/lib/api';
 
 const S: Record<string, React.CSSProperties> = {
   page: { display: 'flex', flexDirection: 'column', gap: 16 },
@@ -22,19 +23,19 @@ const S: Record<string, React.CSSProperties> = {
 };
 
 type Hop = { engine: string; realm: string };
-const ENGINES = ['wb', 'qd', 'trae'];
+const ENGINES: Engine[] = ['wb', 'qd', 'trae'];
 const REALMS = ['cn', 'intl'];
 
-function newRule(): RouteRule {
+function newRule(name: string): RouteRule {
   return {
-    id: 'r' + Date.now().toString(36), name: '新规则', enabled: true, priority: 100,
+    id: 'r' + Date.now().toString(36), name: name, enabled: true, priority: 100,
     match: { models: [], realms: [], engines: [] },
     action: { chain: [{ engine: 'wb', realm: 'cn' }], stop_on_miss: false },
   };
 }
 
-export default function RoutingView(props: { t?: (k: string) => string }) {
-  const t = props.t || ((k: string) => k);
+export default function RoutingView() {
+  const { t } = useLang();
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ['hub-routing'], queryFn: hubRouting, staleTime: 10_000 });
   const doc: RoutingDoc = q.data || { rules: [], policy: { strategy: 'first-available', session_affinity: true, max_fallbacks: 2 }, revision: 0 };
@@ -79,7 +80,7 @@ export default function RoutingView(props: { t?: (k: string) => string }) {
         <p style={S.sub}>{t('routing.subtitle')}</p>
       </div>
       <div style={S.row}>
-        <button style={S.btn} onClick={() => setDraft([...rules, newRule()])}>{t('routing.new')}</button>
+        <button style={S.btn} onClick={() => setDraft([...rules, newRule(t('routing.defaultName'))])}>{t('routing.new')}</button>
         <button style={S.btnPrimary} disabled={!dirty || busy} onClick={save}>{t('routing.save')}</button>
       </div>
     </div>
@@ -105,7 +106,7 @@ export default function RoutingView(props: { t?: (k: string) => string }) {
             {pv.hops.length === 0 ? <span style={{ fontSize: 12, color: 'var(--fg-mute)' }}>—</span> : null}
             {pv.hops.map((h, i) => (
               <span key={i} style={{ ...S.hop, opacity: h.holds_model ? 1 : 0.5 }}>
-                {i + 1}. {h.engine}/{h.realm} · {h.ready}
+                {i + 1}. {ENGINE_LABELS[h.engine as Engine] || h.engine}/{t('realm.' + h.realm + '.short')} · {t('routing.ready')} {h.ready}
               </span>
             ))}
           </div>
@@ -128,7 +129,7 @@ export default function RoutingView(props: { t?: (k: string) => string }) {
               <label style={{ fontSize: 12, color: 'var(--fg-dim)', display: 'flex', gap: 6, alignItems: 'center' }}>
                 <input type="checkbox" checked={rule.enabled}
                        onChange={(e) => update(rule.id, (r) => { r.enabled = e.target.checked; })} />
-                {rule.enabled ? 'on' : 'off'}
+                {rule.enabled ? t('common.on') : t('common.off')}
               </label>
               <button style={{ ...S.btn, marginLeft: 'auto' }}
                       onClick={() => setDraft(rules.filter((x) => x.id !== rule.id))}>{t('routing.delete')}</button>
@@ -148,12 +149,12 @@ export default function RoutingView(props: { t?: (k: string) => string }) {
                   {idx + 1}.
                   <select value={hop.engine} style={{ ...S.input, padding: '2px 4px' }}
                           onChange={(e) => update(rule.id, (r) => { r.action.chain[idx].engine = e.target.value; })}>
-                    {ENGINES.map((x) => <option key={x} value={x}>{x}</option>)}
+                    {ENGINES.map((x) => <option key={x} value={x}>{ENGINE_LABELS[x]}</option>)}
                   </select>
                   <select value={hop.realm} style={{ ...S.input, padding: '2px 4px' }}
                           onChange={(e) => update(rule.id, (r) => { r.action.chain[idx].realm = e.target.value; })}>
-                    <option value="">any</option>
-                    {REALMS.map((x) => <option key={x} value={x}>{x}</option>)}
+                    <option value="">{t('routing.anyRealm')}</option>
+                    {REALMS.map((x) => <option key={x} value={x}>{t('realm.' + x + '.short')}</option>)}
                   </select>
                   <button style={{ appearance: 'none', border: 0, background: 'transparent', color: 'var(--fg-mute)', cursor: 'pointer' }}
                           onClick={() => update(rule.id, (r) => { r.action.chain.splice(idx, 1); if (!r.action.chain.length) r.action.chain.push({ engine: 'wb', realm: 'cn' }); })}>×</button>
