@@ -5944,6 +5944,22 @@ def _solo_tool_calls(slots):
     return out
 
 
+def _solo_urlopen(req, timeout):
+    """SOLO 出站请求：代理端口拒绝连接时直连重试一次。
+
+    系统/环境代理若指向一个已退出的本机端口（换了端口或代理程序没起），
+    urllib 会把出站全塞给那个死端口并立刻 ECONNREFUSED；而这条通道直连
+    上游本身是通的。仅在「连接被拒」时退直连，其余错误原样抛出。
+    """
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.URLError as exc:
+        if not isinstance(getattr(exc, "reason", None), ConnectionRefusedError):
+            raise
+        direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return direct.open(req, timeout=timeout)
+
+
 def trae_solo_chat(account, payload, timeout=180):
     """POST /api/agent/v3/llm_utils_chat (function=solo_work_lite).
 
@@ -6008,7 +6024,7 @@ def trae_solo_chat(account, payload, timeout=180):
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         headers=headers, method="POST")
     try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
+        resp = _solo_urlopen(req, timeout)
     except urllib.error.HTTPError as exc:
         detail = exc.read(2000).decode("utf-8", "replace")
         raise RuntimeError("solo HTTP %s: %s" % (exc.code, detail[:800]))

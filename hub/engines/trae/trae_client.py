@@ -447,7 +447,17 @@ def _opener(proxy=None):
 
 
 def _open(req, timeout, proxy=None):
-    return _opener(proxy).open(req, timeout=timeout)
+    """出站请求：代理端口拒绝连接时直连重试一次（见 trae_proxy._solo_urlopen）。"""
+    try:
+        return _opener(proxy).open(req, timeout=timeout)
+    except urllib.error.URLError as exc:
+        if not isinstance(getattr(exc, "reason", None), ConnectionRefusedError):
+            raise
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=_ssl_context()),
+        )
+        return opener.open(req, timeout=timeout)
 
 
 def _decode(raw):
