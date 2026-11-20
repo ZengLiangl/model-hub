@@ -183,6 +183,26 @@ HOP_BY_HOP = frozenset((
 DROP_REQUEST_HEADERS = HOP_BY_HOP | frozenset(("host", "content-length"))
 #: 响应侧额外丢掉：长度我们自己按收到的字节写。
 DROP_RESPONSE_HEADERS = HOP_BY_HOP | frozenset(("content-length",))
+#: 合并模式换引擎 key 时要清掉的鉴权头（小写）。
+#  Node / undici / OpenAI SDK 发出的是小写 `authorization`；若只写
+#  `Authorization` 而不删旧键，http.client 会把两份都发出去，引擎先读到
+#  客户端那把合并 key → 401「merged keys only work on the portal」。
+_UPSTREAM_AUTH_HEADERS = frozenset(("authorization", "x-api-key", "api-key"))
+
+
+def apply_upstream_auth(headers, upstream_key):
+    """用引擎认识的 key 覆盖客户端鉴权头（大小写不敏感去重）。
+
+    @param headers: 即将交给 http.client 的请求头字典（会被就地修改）
+    @param upstream_key: 该引擎自己的一把启用 key
+    @return: 传入的 headers（便于链式调用）
+    """
+    for name in list(headers):
+        if name.lower() in _UPSTREAM_AUTH_HEADERS:
+            del headers[name]
+    headers["Authorization"] = "Bearer " + str(upstream_key)
+    headers["x-api-key"] = str(upstream_key)
+    return headers
 
 
 # --------------------------------------------------------------------------- 小工具
@@ -1389,9 +1409,8 @@ class PortalHandler(BaseHTTPRequestHandler):
             headers[_HUB_INTERNAL_HEADER] = _inner
         if upstream_key:
             # 合并模式：用**该引擎自己的一把 key** 换掉客户端那把（客户端用的是
-            # 合并 key，引擎不认识它）。x-api-key 一起换，免得引擎优先读它。
-            headers["Authorization"] = "Bearer " + str(upstream_key)
-            headers["x-api-key"] = str(upstream_key)
+            # 合并 key，引擎不认识它）。必须大小写不敏感删旧头，见 apply_upstream_auth。
+            apply_upstream_auth(headers, upstream_key)
         headers.setdefault("X-Forwarded-For", self.client_address[0])
         headers.setdefault("X-Forwarded-Host", self.headers.get("Host") or "")
         headers.setdefault("X-Forwarded-Proto", "http")
@@ -1527,8 +1546,8 @@ class PortalHandler(BaseHTTPRequestHandler):
                 continue
             headers[name] = value
         if upstream_key:
-            headers["Authorization"] = "Bearer " + str(upstream_key)
-            headers["x-api-key"] = str(upstream_key)
+            # 与 _proxy_once 同口径：Node 小写 authorization 必须先清再写。
+            apply_upstream_auth(headers, upstream_key)
         headers["Accept-Encoding"] = "identity"
         timeout = getattr(self.server, "proxy_timeout", 120)
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
