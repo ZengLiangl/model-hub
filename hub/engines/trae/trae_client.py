@@ -38,10 +38,7 @@ import datetime
 import hashlib
 import json
 import os
-import platform
 import socket
-import ssl
-import subprocess
 import sys
 import threading
 import time
@@ -56,13 +53,15 @@ __all__ = [
     "REALMS", "UpstreamError", "auth_headers", "build_chat_body", "open_chat",
     "iter_events", "collect", "chat_once", "refresh_account", "ensure_token",
     "is_expired", "fetch_model_list", "fetch_usage", "fetch_entitlement", "checkin_status", "claim_checkin",
-    "import_desktop_accounts", "decrypt_icube_blob", "decode_auth_blob",
+    "import_desktop_accounts", "appdata_dir", "user_home",
+    "desktop_storage_candidates", "desktop_storage_paths",
+    "temp_token_candidates", "decrypt_icube_blob", "decode_auth_blob",
     "build_icube_blob", "aes_cbc_encrypt", "aes_cbc_decrypt", "realm_of",
     "account_public", "self_test", "request_json", "chat_once",
     "import_desktop_devices", "build_device_proof", "ec_private_key_from_pem",
     "p256_sign", "p256_verify", "fetch_activity", "generate_temp_token",
     "classify_error", "_as_mapping", "refresh_backoff_remaining",
-    "reset_refresh_backoff",
+    "reset_refresh_backoff", "is_enterprise_account", "ensure_personal_account",
 ]
 
 # ---------------------------------------------------------------------------
@@ -187,6 +186,16 @@ class UpstreamError(Exception):
                    status, payload=data)
 
 
+from trae_account_types import ENTERPRISE_UNSUPPORTED_MESSAGE, is_enterprise_account
+
+def ensure_personal_account(value):
+    """Block known enterprise identities before personal routing or transport."""
+    if is_enterprise_account(value):
+        raise UpstreamError("unsupported_enterprise_account",
+                            ENTERPRISE_UNSUPPORTED_MESSAGE, status=400)
+    return value
+
+
 # ---------------------------------------------------------------------------
 # 账号对象适配（dict / trae_accounts.Account / dataclass / 任意带字段对象）
 # ---------------------------------------------------------------------------
@@ -202,6 +211,10 @@ _ACCOUNT_ATTR_ALIASES = (
     ("realm", ("realm",)),
     ("userRegion", ("userRegion", "user_region")),
     ("account", ("account", "profile")),
+    ("extra", ("extra",)),
+    ("scope", ("scope",)),
+    ("loginScope", ("loginScope",)),
+    ("saasBootConfig", ("saasBootConfig",)),
     ("proxy", ("proxy", "egress", "proxy_own")),
     ("headersExtra", ("headersExtra", "headers_extra")),
 )
@@ -217,6 +230,7 @@ def _as_mapping(account):
     if account is None:
         return {}
     if isinstance(account, dict):
+        ensure_personal_account(account)
         return dict(account)
     merged = {}
     for name in ("to_desktop_dict", "to_dict", "as_dict"):
@@ -259,6 +273,7 @@ def _as_mapping(account):
             if value not in (None, ""):
                 merged[target] = value
                 break
+    ensure_personal_account(merged)
     return merged
 
 
@@ -291,6 +306,7 @@ def _uid(account):
 def normalize_realm(realm):
     """'cn'/'CN'/'china' -> 'cn'；其余一律 intl（双区只有两种）。"""
     raw = str(realm or "").strip().lower()
+    ensure_personal_account({"realm": raw})
     if raw in ("cn", "china", "zh", "国内", "国内版"):
         return "cn"
     if raw in ("intl", "us", "global", "sg", "国际", "国际版"):
@@ -366,58 +382,6 @@ def _hosts(account, realm, base="core"):
 # ---------------------------------------------------------------------------
 _OPENER_LOCK = threading.Lock()
 _OPENERS = {}
-_SSL_CONTEXT = None
-_SSL_LOCK = threading.Lock()
-
-
-def _system_ca_pem():
-    """返回本机系统信任库的 PEM（macOS 钥匙串 + 系统证书文件）。
-
-    python.org 官方安装的 CPython 自带 CA bundle 会缺部分中间证书，访问
-    trae-api-cn.mchost.guru 等上游时报 CERTIFICATE_VERIFY_FAILED，而 curl /
-    浏览器走 macOS 系统钥匙串则正常。这里把系统信任库追加进来补全。
-    失败一律返回空串，由调用方回退到默认 context。
-    """
-    parts = []
-    if platform.system() == "Darwin":
-        try:
-            out = subprocess.run(
-                ["security", "find-certificate", "-a", "-p",
-                 "/System/Library/Keychains/SystemRootCertificates.keychain"],
-                capture_output=True, text=True, timeout=10).stdout or ""
-            if out.strip():
-                parts.append(out)
-        except Exception:
-            pass
-    for path in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
-        try:
-            if os.path.isfile(path):
-                with open(path, "rb") as fh:
-                    parts.append(fh.read().decode("utf-8", "replace"))
-        except Exception:
-            pass
-    return "\n".join(p for p in parts if p.strip())
-
-
-def _ssl_context():
-    """进程级共享出站 SSL context：默认校验之上叠加系统信任库（懒建、只建一次）。
-
-    只补全证书链，**不放松校验**：verify_mode 仍为 CERT_REQUIRED、check_hostname
-    仍开启。
-    """
-    global _SSL_CONTEXT
-    if _SSL_CONTEXT is None:
-        with _SSL_LOCK:
-            if _SSL_CONTEXT is None:
-                ctx = ssl.create_default_context()
-                extra = _system_ca_pem()
-                if extra:
-                    try:
-                        ctx.load_verify_locations(cadata=extra)
-                    except Exception:
-                        pass
-                _SSL_CONTEXT = ctx
-    return _SSL_CONTEXT
 
 
 def _proxy_map():
@@ -438,26 +402,13 @@ def _opener(proxy=None):
     with _OPENER_LOCK:
         opener = _OPENERS.get(key)
         if opener is None:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler(dict(key)),
-                urllib.request.HTTPSHandler(context=_ssl_context()),
-            )
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler(dict(key)))
             _OPENERS[key] = opener
         return opener
 
 
 def _open(req, timeout, proxy=None):
-    """出站请求：代理端口拒绝连接时直连重试一次（见 trae_proxy._solo_urlopen）。"""
-    try:
-        return _opener(proxy).open(req, timeout=timeout)
-    except urllib.error.URLError as exc:
-        if not isinstance(getattr(exc, "reason", None), ConnectionRefusedError):
-            raise
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}),
-            urllib.request.HTTPSHandler(context=_ssl_context()),
-        )
-        return opener.open(req, timeout=timeout)
+    return _opener(proxy).open(req, timeout=timeout)
 
 
 def _decode(raw):
@@ -637,6 +588,12 @@ def auth_headers(account, realm=None):
         "User-Agent": REALMS[realm]["ua"],
     }
     headers.update(trae_fingerprint.trae_device_headers(_uid(account)))
+    # Browser OAuth binds the token to this session device; do not replace it
+    # with the UID-derived legacy identity after account persistence/restart.
+    if account.get("device_id"):
+        headers["X-Device-Id"] = str(account["device_id"])
+    if account.get("machine_id"):
+        headers["X-Machine-Id"] = str(account["machine_id"])
     headers["X-Request-Id"] = trae_fingerprint.trae_request_id()
     return headers
 
@@ -1212,6 +1169,8 @@ def _refresh_account_request(account, timeout=30, key=None):
             raise last_exc
         raise _network_error([h + PATH_EXCHANGE_TOKEN for h in hosts], last_exc)
 
+    # Reject an unexpected tenant response before flattening away its metadata.
+    ensure_personal_account(parsed)
     result = parsed.get("Result") if isinstance(parsed, dict) else None
     if not isinstance(result, dict):
         result = parsed if isinstance(parsed, dict) else {}
@@ -2001,50 +1960,97 @@ def _resolve_device_credentials(account, realm):
 REGION_CODES = {"cn": "CN", "intl": "US"}
 
 
-def _appdata():
-    return (os.environ.get("APPDATA")
-            or os.path.join(os.path.expanduser("~"), "AppData", "Roaming"))
+APP_DIRS = (("intl", "Trae"), ("cn", "Trae CN"))
 
 
-def _official_desktop_roots():
-    """两个官方客户端的数据根目录（按平台）。
+def appdata_dir(platform_name=None):
+    """跨平台应用数据根目录（Desktop storage.json 的父目录）。
 
-    Trae 是 VS Code 系客户端，userData 目录各平台不同：
-      Windows  %APPDATA%/Trae、%APPDATA%/Trae CN
-      macOS    ~/Library/Application Support/Trae、.../Trae CN
-      Linux    $XDG_CONFIG_HOME/Trae、.../Trae CN
-    之前只写了 Windows 路径，macOS 上扫描永远为空。
+    Windows : %APPDATA%（缺省 ~/AppData/Roaming）
+    macOS   : ~/Library/Application Support
+    Linux   : $XDG_CONFIG_HOME（缺省 ~/.config）
+    TRAE_APPDATA 显式覆盖（测试 / 便携部署），优先级最高。
     """
-    home = os.path.expanduser("~")
-    if sys.platform == "darwin":
-        base = os.path.join(home, "Library", "Application Support")
-    elif os.name == "nt" or sys.platform == "win32":
-        base = _appdata()
-    else:
-        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
-    return [(os.path.join(base, "Trae"), "intl"),
-            (os.path.join(base, "Trae CN"), "cn")]
+    override = (os.environ.get("TRAE_APPDATA") or "").strip()
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    # issue：mac/Linux 也支持用 APPDATA 注入（优先级高于平台默认，低于 TRAE_APPDATA）
+    injected = (os.environ.get("APPDATA") or "").strip()
+    if injected:
+        return os.path.abspath(os.path.expanduser(injected))
+    name = str(platform_name or sys.platform).lower()
+    if name.startswith("win"):
+        return os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
+    if name.startswith("darwin") or name == "mac":
+        return os.path.join(os.path.expanduser("~"),
+                            "Library", "Application Support")
+    return (os.environ.get("XDG_CONFIG_HOME")
+            or os.path.join(os.path.expanduser("~"), ".config"))
 
 
-def desktop_storage_paths():
-    """候选 storage.json：TRAE_DESKTOP_DIRS 优先（测试用），否则两个官方目录。"""
-    entries = []
-    extra = os.environ.get("TRAE_DESKTOP_DIRS") or ""
-    roots = []
-    for part in extra.split(os.pathsep):
-        part = part.strip()
-        if part:
-            roots.append((part, ""))
-    if not roots:
-        roots = _official_desktop_roots()
-    for root, hint in roots:
-        storage = os.path.join(root, "User", "globalStorage", "storage.json")
-        if os.path.isfile(storage):
-            if not hint:
-                low = root.lower()
-                hint = "cn" if ("trae cn" in low or low.endswith("trae-cn")) else "intl"
-            entries.append({"path": storage, "realm": hint})
-    return entries
+def user_home():
+    """用户主目录（TRAE_USER_HOME 可覆盖：测试夹具 / 容器）。"""
+    override = (os.environ.get("TRAE_USER_HOME") or "").strip()
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.expanduser("~")
+
+
+def _appdata():
+    """兼容旧名：默认平台的 appdata 根目录。"""
+    return appdata_dir()
+
+
+def _realm_hint_from_path(path):
+    """按路径判区域：含 Trae CN / .trae-cn -> cn，其余 intl。"""
+    low = os.path.abspath(str(path or "")).replace("\\", "/").lower()
+    if "trae cn" in low or "trae-cn" in low:
+        return "cn"
+    return "intl"
+
+
+def _storage_entry(root, hint=None):
+    root = os.path.abspath(os.path.expanduser(str(root)))
+    path = os.path.join(root, "User", "globalStorage", "storage.json")
+    return {"path": path, "root": root,
+            "realm": hint or _realm_hint_from_path(root),
+            "kind": "app", "file": "storage.json",
+            "exists": os.path.isfile(path)}
+
+
+def desktop_storage_candidates(platform_name=None, appdata=None):
+    """**全部**候选 storage.json（含不存在的），供扫描页区分「未登录/读取失败」。
+
+    TRAE_DESKTOP_DIRS（os.pathsep 分隔的根目录）优先：测试夹具 / 自定义安装目录。
+    """
+    extra = (os.environ.get("TRAE_DESKTOP_DIRS") or "").strip()
+    if extra:
+        entries = []
+        for part in extra.split(os.pathsep):
+            part = part.strip()
+            if part:
+                entries.append(_storage_entry(part))
+        return entries
+    base = appdata or appdata_dir(platform_name)
+    return [_storage_entry(os.path.join(base, name), realm)
+            for realm, name in APP_DIRS]
+
+
+def desktop_storage_paths(platform_name=None, appdata=None):
+    """只返回**存在**的 storage.json（导入用；扫描请用 candidates）。"""
+    return [e for e in desktop_storage_candidates(platform_name, appdata)
+            if e.get("exists")]
+
+
+def temp_token_candidates(home=None):
+    """CLI 兜底 token 文件候选（含不存在的）。"""
+    home = home or user_home()
+    out = []
+    for realm, directory in (("cn", ".trae-cn"), ("intl", ".trae")):
+        path = os.path.join(home, directory, "trae-jwt-token")
+        out.append({"path": path, "realm": realm, "kind": "cli",
+                    "file": "trae-jwt-token", "exists": os.path.isfile(path)})
+    return out
 
 
 def _read_json_file(path):
@@ -2068,43 +2074,53 @@ def _realm_from_body(body, hint):
     return hint or "intl"
 
 
-def _temp_token_accounts(existing_realms):
-    """兜底：~/.trae-cn/trae-jwt-token（7 天临时 token，仅 IDE 数据面可用）。"""
-    home = os.path.expanduser("~")
-    candidates = ((".trae-cn", "cn"), (".trae", "intl"))
-    out = []
-    for directory, realm in candidates:
-        if realm in existing_realms:
-            continue
-        path = os.path.join(home, directory, "trae-jwt-token")
-        if not os.path.isfile(path):
-            continue
+def _read_temp_token(path):
+    """读 7 天临时 token 文件（纯串或 JSON），失败返回空串。"""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read().strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+    if text.startswith("{"):
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                text = handle.read().strip()
-        except OSError:
+            parsed = json.loads(text)
+            text = (parsed.get("token") or parsed.get("accessToken")
+                    or parsed.get("Token") or "")
+        except ValueError:
+            text = ""
+    return str(text or "").strip()
+
+
+def _account_from_temp_token(path, realm):
+    """临时 token 文件 -> 账号 dict（无 uid；realm 由路径/调用方给）。"""
+    token = _read_temp_token(path)
+    if not token:
+        return None
+    return {
+        "token": token,
+        "userId": "",
+        "realm": realm,
+        "host": REALMS[realm]["account"],
+        "userRegion": {"region": REGION_CODES[realm]},
+        "tokenSource": "desktop-temp-token",
+        "tempToken": True,
+        "ideOnly": True,
+        "source": path,
+    }
+
+
+def _temp_token_accounts(existing_realms, home=None):
+    """兜底：~/.trae-cn/trae-jwt-token（7 天临时 token，仅 IDE 数据面可用）。"""
+    out = []
+    for entry in temp_token_candidates(home):
+        realm = entry["realm"]
+        if realm in existing_realms or not entry["exists"]:
             continue
-        token = text
-        if text.startswith("{"):
-            try:
-                parsed = json.loads(text)
-                token = (parsed.get("token") or parsed.get("accessToken")
-                         or parsed.get("Token") or "")
-            except ValueError:
-                token = ""
-        if not token:
-            continue
-        out.append({
-            "token": token,
-            "userId": "",
-            "realm": realm,
-            "host": REALMS[realm]["account"],
-            "userRegion": {"region": REGION_CODES[realm]},
-            "tokenSource": "desktop-temp-token",
-            "tempToken": True,
-            "ideOnly": True,
-            "source": path,
-        })
+        account = _account_from_temp_token(entry["path"], realm)
+        if account:
+            out.append(account)
     return out
 
 
@@ -2148,16 +2164,74 @@ def import_desktop_devices():
     return devices
 
 
-def import_desktop_accounts():
-    """解密本机 Trae / Trae CN 的 storage.json，返回账号对象列表。
+def _accounts_from_storage(storage, entry, now, seen, errors):
+    """从一个 storage.json dict 里解出账号（键 iCubeAuthInfo://icube.cloudide）。
 
-    - 国际版：%APPDATA%/Trae/User/globalStorage/storage.json
-    - 国内版：%APPDATA%/Trae CN/User/globalStorage/storage.json
-    - key：iCubeAuthInfo://icube.cloudide（tc/AES-128-CBC 封装）
-    - 兜底：~/.trae-cn/trae-jwt-token（临时 token，仅作 IDE 数据面兜底）
+    错误只记录 path/key/原因，不记录任何 token 片段。
+    """
+    out = []
+    for key, value in storage.items():
+        if not isinstance(key, str) or not key.startswith("iCubeAuthInfo://"):
+            continue
+        if not key.endswith("icube.cloudide"):
+            continue  # usertag 等明文条目不含 token，不导入
+        try:
+            body = value if isinstance(value, dict) else decrypt_icube_blob(value)
+        except Exception as exc:
+            errors.append({"path": entry["path"], "key": key, "error": str(exc)})
+            continue
+        try:
+            ensure_personal_account(body)
+        except UpstreamError as exc:
+            errors.append({"path": entry["path"], "key": key, "error": str(exc)})
+            continue
+        if not isinstance(body, dict) or not _token(body):
+            continue
+        realm = _realm_from_body(body, entry.get("realm"))
+        uid = _uid(body)
+        dedupe = (realm, uid or _token(body)[-8:])
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        account = dict(body)
+        account["realm"] = realm
+        account["uid"] = uid
+        account["tokenSource"] = "desktop-storage"
+        account["source"] = entry["path"]
+        account["storageKey"] = key
+        account["importedAt"] = now
+        out.append(account)
+    return out
 
-    去重键 (realm, userId)；同一区域只保留第一份。任何异常只跳过该条目，
-    不会让整次导入失败（一个文件坏了不影响另一个区）。返回值含敏感字段，
+
+def _entry_for_path(path):
+    """把用户给的 path 规整成扫描/导入用 entry（文件或目录都接受）。"""
+    target = os.path.abspath(os.path.expanduser(str(path or "")))
+    hint = _realm_hint_from_path(target)
+    if os.path.isdir(target):
+        return _storage_entry(target, hint)
+    if os.path.basename(target) == "trae-jwt-token":
+        return {"path": target, "realm": hint, "kind": "cli",
+                "file": "trae-jwt-token", "exists": os.path.isfile(target)}
+    return {"path": target, "realm": hint, "kind": "app",
+            "file": os.path.basename(target), "exists": os.path.isfile(target)}
+
+
+def import_desktop_accounts(path=None, paths=None, include_temp=True,
+                            platform_name=None, appdata=None, home=None):
+    """解密本机 Trae / Trae CN 的 storage.json，返回账号 dict 列表。
+
+    路径（跨平台，见 appdata_dir）：
+      Windows  %APPDATA%/Trae/User/globalStorage/storage.json
+      macOS    ~/Library/Application Support/Trae/User/globalStorage/storage.json
+      Linux    $XDG_CONFIG_HOME/Trae/User/globalStorage/storage.json
+    国内版把 Trae 换成 Trae CN。key：iCubeAuthInfo://icube.cloudide
+    兜底：~/.trae-cn/trae-jwt-token（临时 token，仅 IDE 数据面）。
+
+    path / paths：**只**导入指定文件（目录 = 其 User/globalStorage/storage.json），
+                  不再扫描其它位置，也不附加临时 token —— 显式路径只导该路径。
+    默认：本机双区 storage.json + 临时 token 兜底。
+    去重键 (realm, userId)；单条损坏只跳过，不影响其它文件。返回值含敏感字段，
     打印请先过 account_public()。
     """
     accounts = []
@@ -2165,7 +2239,25 @@ def import_desktop_accounts():
     now = datetime.datetime.now(datetime.timezone.utc) \
         .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     errors = []
-    for entry in desktop_storage_paths():
+    explicit = [str(p) for p in ([path] if path else []) + list(paths or []) if p]
+    if explicit:
+        entries = [_entry_for_path(item) for item in explicit]
+        include_temp = False
+    else:
+        entries = desktop_storage_paths(platform_name=platform_name,
+                                        appdata=appdata)
+    for entry in entries:
+        if not entry.get("exists"):
+            errors.append({"path": entry["path"], "error": "not found"})
+            continue
+        if entry.get("kind") == "cli":
+            extra = _account_from_temp_token(entry["path"], entry["realm"])
+            dedupe = (entry["realm"], "temp-token")
+            if extra and dedupe not in seen:
+                seen.add(dedupe)
+                extra["importedAt"] = now
+                accounts.append(extra)
+            continue
         try:
             storage = _read_json_file(entry["path"])
         except Exception as exc:
@@ -2173,51 +2265,27 @@ def import_desktop_accounts():
             continue
         if not isinstance(storage, dict):
             continue
-        for key, value in storage.items():
-            if not isinstance(key, str) or not key.startswith("iCubeAuthInfo://"):
-                continue
-            if not key.endswith("icube.cloudide"):
-                continue  # usertag 等明文条目不含 token，不导入
-            try:
-                body = value if isinstance(value, dict) else decrypt_icube_blob(value)
-            except Exception as exc:
-                errors.append({"path": entry["path"], "key": key, "error": str(exc)})
-                continue
-            if not isinstance(body, dict) or not _token(body):
-                continue
-            realm = _realm_from_body(body, entry["realm"])
-            uid = _uid(body)
-            dedupe = (realm, uid or _token(body)[-8:])
+        accounts.extend(_accounts_from_storage(storage, entry, now, seen, errors))
+    if include_temp:
+        realms = {a["realm"] for a in accounts}
+        for extra in _temp_token_accounts(realms, home=home):
+            dedupe = (extra["realm"], "temp-token")
             if dedupe in seen:
                 continue
             seen.add(dedupe)
-            account = dict(body)
-            account["realm"] = realm
-            account["uid"] = uid
-            account["tokenSource"] = "desktop-storage"
-            account["source"] = entry["path"]
-            account["storageKey"] = key
-            account["importedAt"] = now
-            accounts.append(account)
-    realms = {a["realm"] for a in accounts}
-    for extra in _temp_token_accounts(realms):
-        dedupe = (extra["realm"], "temp-token")
-        if dedupe in seen:
-            continue
-        seen.add(dedupe)
-        extra["importedAt"] = now
-        accounts.append(extra)
+            extra["importedAt"] = now
+            accounts.append(extra)
     accounts.sort(key=lambda a: (0 if a.get("realm") == "cn" else 1,
-                                 str(a.get("uid") or "")))
-    # 错误只带路径与原因，不带任何 token 片段
+                                  str(a.get("uid") or "")))
+    # 错误只带路径与原因，不带任何 token 片段；只有非 not-found 才算真失败。
     if errors:
         for account in accounts:
             account.setdefault("importErrors", errors)
-        if not accounts:
+        real = [e for e in errors if str(e.get("error")) != "not found"]
+        if not accounts and real:
             raise UpstreamError("desktop_import_failed",
-                                "Desktop 凭证导入失败：%s" % errors[0]["error"], None)
+                                "Desktop 凭证导入失败：%s" % real[0]["error"], None)
     return accounts
-
 
 def _desktop_storage_for(realm):
     realm = normalize_realm(realm)
@@ -2256,6 +2324,7 @@ def reload_desktop_auth(account, realm=None):
     body = desktop_auth_body(realm)
     if not body:
         return None
+    ensure_personal_account(body)
     token = body.get("token") or ""
     if not token:
         return None
@@ -2297,6 +2366,7 @@ def sync_desktop_auth(account, realm=None, backup=True):
             body = json.loads(body.decode("utf-8"))
         if not isinstance(body, dict):
             body = {}
+        ensure_personal_account(body)
         body["token"] = token
         if refresh:
             body["refreshToken"] = refresh
