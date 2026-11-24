@@ -139,6 +139,16 @@ class RefreshSummary(dict):
 # ---------------------------------------------------------------------------
 # 通用小工具
 # ---------------------------------------------------------------------------
+def _tls_opener():
+    """出站 HTTPS opener：补全系统信任库（python.org CPython 缺中间证书）。
+
+    只补链不放松校验：verify_mode = CERT_REQUIRED、check_hostname 保持开启。
+    """
+    import trae_client
+    return urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=trae_client._ssl_context()))
+
+
 def _now():
     return time.time()
 
@@ -696,7 +706,8 @@ def _fallback_refresh(account, timeout=30):
         "User-Agent": cfg["ua"],
     })
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        opener = _tls_opener()
+        with opener.open(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         body = ""

@@ -337,7 +337,16 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_OPENER = urllib.request.build_opener(_NoRedirect)
+def _tls_opener():
+    """出站 opener：补全系统信任库（python.org CPython 自带 CA 缺中间证书）。"""
+    import trae_client
+    return urllib.request.build_opener(
+        _NoRedirect,
+        urllib.request.HTTPSHandler(context=trae_client._ssl_context()),
+    )
+
+
+_OPENER = _tls_opener()
 
 
 def _default_transport(url: str, payload: Mapping[str, Any],

@@ -141,6 +141,36 @@ def solo_function_for(model):
     return "solo_agent_remote" if model in SOLO_AGENT_ONLY else "solo_work_lite"
 
 
+#: 大小写无关的 SOLO 模型表。合并清单会把 id 统一小写（如 deepseek-v4-pro），
+#: 而 SOLO 表里是官方显示名/上游真名；不做归一就会漏到 raw_chat 触发 4023。
+_SOLO_MODEL_LOWER = {}
+for _name in SOLO_AGENT_MODELS:
+    _key = str(_name).strip()
+    if _key:
+        _SOLO_MODEL_LOWER.setdefault(_key.lower(), _key)
+for _alias, _target in SOLO_MODEL_ALIASES.items():
+    _SOLO_MODEL_LOWER[str(_alias).strip().lower()] = _target
+
+
+def solo_model_key(model):
+    """客户端模型名 -> SOLO 通道的 config_name；不是 SOLO 模型返回 ""。
+
+    客户端拿到的是 /v1/models 的 id（可能是官方显示名，也可能被合并清单
+    统一成小写），这里先做大小写无关匹配、别名映射，再用目录解析兜底。
+    """
+    raw = str(model or "").strip()
+    if not raw:
+        return ""
+    hit = _SOLO_MODEL_LOWER.get(raw.lower())
+    if hit:
+        return hit
+    try:
+        key = trae_catalog.resolve_upstream_key(raw, realm="cn")
+    except Exception:
+        key = raw
+    return _SOLO_MODEL_LOWER.get(str(key or "").strip().lower(), "")
+
+
 CURRENT_REALM = os.environ.get("TRAE_PROXY_DEFAULT_REALM", "cn")
 
 
@@ -6321,6 +6351,33 @@ def _solo_tool_calls(slots):
     return out
 
 
+def _trae_ssl_context():
+    """出站 TLS context：补全系统信任库（python.org CPython 自带 CA 缺中间证书）。"""
+    import trae_client
+    return trae_client._ssl_context()
+
+
+def _tls_urlopen(req, timeout):
+    """出站请求：走带系统信任库的 opener；代理端口拒绝连接时直连重试一次。
+
+    系统/环境代理若指向一个已退出的本机端口（换了端口或代理程序没起），urllib
+    会把出站全塞给那个死端口并立刻 ECONNREFUSED，而这条通道直连上游本身是通的。
+    仅在「连接被拒」时退直连，其余错误原样抛出。
+    """
+    try:
+        return urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=_trae_ssl_context())).open(
+                req, timeout=timeout)
+    except urllib.error.URLError as exc:
+        if not isinstance(getattr(exc, "reason", None), ConnectionRefusedError):
+            raise
+        direct = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=_trae_ssl_context()),
+        )
+        return direct.open(req, timeout=timeout)
+
+
 def trae_solo_chat(account, payload, timeout=180):
     """POST /api/agent/v3/llm_utils_chat (function=solo_work_lite / solo_agent_remote).
 
@@ -6365,7 +6422,8 @@ def trae_solo_chat(account, payload, timeout=180):
         "Request-Traffic-Type": "prod",
     }
     model = str(payload.get("model") or "deepseek-v4.1-flash").strip()
-    model = (_solo_agent_only_key(model)
+    model = (solo_model_key(model)
+             or _solo_agent_only_key(model)
              or SOLO_MODEL_ALIASES.get(model, model).removesuffix("-solo"))
     messages = _solo_messages(payload)
     if not messages:
@@ -6386,7 +6444,7 @@ def trae_solo_chat(account, payload, timeout=180):
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         headers=headers, method="POST")
     try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
+        resp = _tls_urlopen(req, timeout)
     except urllib.error.HTTPError as exc:
         detail = exc.read(2000).decode("utf-8", "replace")
         raise RuntimeError("solo HTTP %s: %s" % (exc.code, detail[:800]))
@@ -9976,7 +10034,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "not found")
 
     def _admin_test_account(self, account):
-        model = "Doubao-1.5-pro" if acc_realm(account) == "cn" else "gpt-4o"
+        model = "seed_m8" if acc_realm(account) == "cn" else "gpt-4o"
         started = time.time()
         try:
             response, used, _ = open_upstream({"model": model, "max_tokens": 32,
@@ -10968,7 +11026,8 @@ class Handler(BaseHTTPRequestHandler):
                     pass
 
     def _handle_agent_solo(self, payload):
-        model = str(payload.get("model") or "deepseek-v4.1-flash")
+        requested_model = str(payload.get("model") or "deepseek-v4.1-flash")
+        model = solo_model_key(requested_model) or requested_model
         agent_model = _solo_agent_only_key(model)
         aliases = ()
         if agent_model:
@@ -11013,7 +11072,7 @@ class Handler(BaseHTTPRequestHandler):
                      "function": {"name": call["function"]["name"],
                                   "arguments": call["function"]["arguments"]}}
                     for i, call in enumerate(tool_calls)]
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
+            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": requested_model,
                      "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
             self._sse_write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
             done = {**chunk, "choices": [{"index": 0, "delta": {},
@@ -11041,7 +11100,7 @@ class Handler(BaseHTTPRequestHandler):
             "id": "chatcmpl-" + uuid.uuid4().hex,
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": model,
+            "model": requested_model,
             "choices": [{"index": 0, "message": message, "finish_reason": result["finish_reason"]}],
             "usage": result["usage"] or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
@@ -11395,7 +11454,7 @@ class Handler(BaseHTTPRequestHandler):
             if str(test_model).strip().lower() == "auto":
                 # `/accounts/test` uses the raw_chat upstream; `auto` is not a
                 # raw model and always returns upstream 400. Pick a real model.
-                test_model = "Doubao-1.5-pro" if acc_realm(account) == "cn" else "gpt-4o"
+                test_model = "seed_m8" if acc_realm(account) == "cn" else "gpt-4o"
             test_payload = {
                 "model": test_model,
                 "messages": [{"role": "user", "content": "hi"}],
@@ -11509,11 +11568,19 @@ class Handler(BaseHTTPRequestHandler):
                 })
             report = POOL.import_rows(rows, realm=forced_realm,
                                       overwrite=overwrite)
+            # trae 的 import_rows 返回计数（imported/updated/skipped/errors），
+            # 不是 wb/qd 的列表形态；同时给前端补顶层计数，否则导入提示永远是 0。
+            added = report.get("imported", 0)
+            invalid = len(report.get("errors") or [])
             log("account import: %d added, %d updated, %d skipped, %d invalid"
-                % (report.get("imported", 0), report.get("updated", 0),
-                   report.get("skipped", 0), len(report.get("errors") or [])))
+                % (added, report.get("updated", 0),
+                   report.get("skipped", 0), invalid))
             return self._json(200, {
                 "count": len(rows),
+                "added": added,
+                "updated": report.get("updated", 0),
+                "skipped": report.get("skipped", 0),
+                "invalid": invalid,
                 "result": report,
                 "accounts": account_views(),
             })
@@ -12140,7 +12207,7 @@ class Handler(BaseHTTPRequestHandler):
         if _qoder_key is not None:
             return self._handle_qoder_chat(payload, _qoder_key)
         model_name = str(payload.get("model") or "")
-        if model_name in SOLO_AGENT_MODELS or _solo_agent_only_key(model_name):
+        if solo_model_key(model_name) or _solo_agent_only_key(model_name):
             return self._handle_agent_solo(payload)
         normalize_tool_choice(payload)
         normalize_tools(payload)
