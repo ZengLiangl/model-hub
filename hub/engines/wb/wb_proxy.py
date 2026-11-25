@@ -12338,6 +12338,70 @@ AFFINITY_MAX_MSGS = int(os.environ.get("WB_AFFINITY_MAX_MSGS", "400") or 0)
 # 取值：≥2 = 页大小（账号数）；1 = 和普通对话一样钉住（等于取消上限）；
 # 0 = 保持 1.6.x 的整池轮转。页的划分见 wb_accounts.AccountPool._page_slice。
 AFFINITY_PAGE_SIZE = int(os.environ.get("WB_AFFINITY_PAGE_SIZE", "3") or 0)
+# >>> hub-patch: client-session-key
+#: 会话身份的来源标记（只用于日志与排障，不发给上游）。
+SESSION_KEY_SOURCES = ("cid", "pck", "usr", "uid", "pfx")
+
+
+def client_session_key(payload):
+    """会话身份：先认客户端**明确**给的字段，最后才回落到内容哈希。
+
+    为什么需要它（实测串会话，2026-11-25）：
+
+    改之前 session_key 只有一个来源 —— ``affinity_route(messages)``，即前 2~3
+    条消息的内容哈希。而两个 DSH 会话的开场（system + 第一句 user + 第一条
+    assistant）经常**逐字相同**，于是算出同一个 key：
+
+        会话A key: pfx-3cd0f3034c500246
+        会话B key: pfx-3cd0f3034c500246     <- 撞了
+
+    这个 key 同时被用在三处（账号粘性绑定 / 上游 conversation_id 派生 /
+    prompt_cache_key），所以两个会话共用同一个账号绑定和同一个上游
+    conversation_id —— 表现就是**内容串线**。
+
+    上游作者在 c1860f0 里把 prompt_cache_key 的**注入**默认关掉了，理由是他
+    实测「上游自己就会缓存前缀，注入它既不改命中率也不改计费」—— 那个结论
+    针对的是**省钱**。但同一个字段还承载**会话身份**语义，关掉注入等于把这
+    层信息一起丢了。
+
+    所以这里把两件事拆开：
+      · 要不要把 prompt_cache_key **发给上游** -> 仍由 prompt_cache_key_enabled()
+        决定（尊重上游的测量结论，默认关）；
+      · 要不要用它**识别会话** -> 本函数负责，与上面那个开关无关。
+
+    优先级对齐 OpenAI 协议本身的意图（客户端越明确越优先）：
+
+      1. conversation_id / conversationId / session_id / sessionId
+         —— 各客户端的会话 id 扩展，最明确；
+      2. prompt_cache_key —— OpenAI 标准字段，就是用来标识「同一段对话」的；
+      3. user —— OpenAI 标准字段，粒度粗（同一用户的不同会话会撞），
+         但两个**不同用户**绝不会撞，比内容哈希可靠；
+      4. metadata.user_id —— Anthropic 兼容形状；
+      5. 都没有 -> 返回 None，调用方回落到 affinity_route 的内容哈希（老行为）。
+
+    返回 (session_key, source)；source 是来源标记，供日志判断这次到底靠什么
+    分的会话 —— 「为什么还串」这个问题的答案就在这个标记里。
+    """
+    if not isinstance(payload, dict):
+        return None, None
+    for field in ("conversation_id", "conversationId", "session_id", "sessionId"):
+        value = payload.get(field)
+        if isinstance(value, str) and value.strip():
+            return "cid-" + value.strip(), "cid"
+    value = payload.get("prompt_cache_key")
+    if isinstance(value, str) and value.strip():
+        return "pck-" + value.strip(), "pck"
+    value = payload.get("user")
+    if isinstance(value, str) and value.strip():
+        return "usr-" + value.strip(), "usr"
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        for field in ("user_id", "userId"):
+            value = metadata.get(field)
+            if isinstance(value, str) and value.strip():
+                return "uid-" + value.strip(), "uid"
+    return None, None
+# <<< hub-patch: client-session-key
 def affinity_route(messages):
     """This conversation's (session_key, page).
 
@@ -18040,6 +18104,19 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # （该函数可能在最前面插入 SYSTEM_PROMPT）。affinity_page 只在超限对话上
     # 有值（页内轮转），客户端自带会话键的请求不参与。
     affinity_page = None
+    # >>> hub-patch: client-session-key
+    # 先认客户端明确给的会话身份，最后才回落到内容哈希。
+    #
+    # 为什么顺序是这个（实测串会话）：affinity_route 只看前 2~3 条消息的哈希，
+    # 而两个 DSH 会话的开场常常逐字相同 -> 算出同一个 pfx- key -> 共用同一账号
+    # 绑定与同一上游 conversation_id -> 内容串线。客户端给了 conversation_id /
+    # prompt_cache_key / user 时，那些字段才是**权威**的会话身份，内容哈希只是
+    # 猜。详细推导见 client_session_key() 的 docstring。
+    if not session_key:
+        session_key, _sk_source = client_session_key(payload)
+        if session_key and AFFINITY_DEBUG:
+            log("session key from client (%s): %s" % (_sk_source, session_key))
+    # <<< hub-patch: client-session-key
     if not session_key:
         session_key, affinity_page = affinity_route(upstream_body.get("messages"))
         if session_key and AFFINITY_DEBUG:
