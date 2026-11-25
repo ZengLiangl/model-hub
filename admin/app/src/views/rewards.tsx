@@ -8,6 +8,7 @@ import {
   Badge, Button, Card, EmptyState, EngineBadge, SkeletonCard, SkeletonRows, useToast,
 } from '@/components/ui';
 import { useLang } from '@/lib/i18n';
+import { fmtInt } from '@/lib/format';
 import { get, post } from '@/lib/http';
 import { API } from '@/lib/api';
 
@@ -90,8 +91,7 @@ function numOrNull(v: unknown): number | null {
 }
 
 function fmtNum(n: number | null | undefined): string {
-  if (n === null || n === undefined || !Number.isFinite(n)) return '—';
-  return n.toLocaleString('en-US');
+  return fmtInt(n);
 }
 
 /** 任务状态 → 徽标。取值实测：completed(可领) / claimed(已领) / not_accepted(不可领) / in_progress。 */

@@ -312,6 +312,31 @@ export type MergedKey = { id?: string; name?: string; key?: string; enabled?: bo
 
 export const hubKeys = () => get<HubKeys>(API + "/hub/keys");
 
+/** 模型冷却：引擎侧记录的上游限流窗口（429 / code 6004 的恢复时刻）。
+ *
+ * 数据源是各引擎 /accounts 的 modelCooldowns —— 不是网关自己估的，所以这里的
+ * 「还剩多久」可以直接当成「再等多久就能用」。
+ */
+export type ModelCooldown = {
+  engine: Engine;
+  realm: string;
+  model: string;
+  /** 恢复时刻（epoch 秒） */
+  until: number;
+  /** 剩余秒数（服务端算好的，避免前端时钟偏差） */
+  seconds_left: number;
+};
+export type HubCooldowns = {
+  now?: number;
+  model?: string | null;
+  cooldowns?: ModelCooldown[];
+  /** 整区都在账号级冷却的 (引擎:区) */
+  parked?: string[];
+  engines?: Record<string, Record<string, number>>;
+};
+export const hubCooldowns = (model?: string) =>
+  get<HubCooldowns>(API + "/hub/cooldowns", { query: model ? { model: model } : undefined });
+
 /** 门户设置：统一登录口令是否仍为默认值（三家引擎共用这一套口令）。 */
 export type HubSettings = {
   routing?: Record<string, unknown>;

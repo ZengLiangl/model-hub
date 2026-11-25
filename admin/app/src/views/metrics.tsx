@@ -15,6 +15,7 @@ import { AreaChart, BarChart, Donut } from '@/components/charts';
 import { Button, Card, SkeletonRows } from '@/components/ui';
 import { useLang } from '@/lib/i18n';
 import { ENGINES, ENGINE_LABELS, hubByModel, hubTimeseries, hubUsage, usageByAccount, type Engine } from '@/lib/api';
+import { fmtCompact, fmtInt } from '@/lib/format';
 
 type RangeKey = "today" | "7d" | "30d" | "month" | "all" | "custom";
 
@@ -26,19 +27,6 @@ const RANGES: { key: RangeKey; zh: string; en: string }[] = [
   { key: "all", zh: "全部", en: "All" },
   { key: "custom", zh: "自定义", en: "Custom" },
 ];
-
-function fmtInt(n: number | undefined): string {
-  if (typeof n !== "number" || !Number.isFinite(n)) return "—";
-  return Math.round(n).toLocaleString("en-US");
-}
-
-function fmtCompact(n: number | undefined): string {
-  if (typeof n !== "number" || !Number.isFinite(n)) return "—";
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
-  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
-  return String(Math.round(n));
-}
 
 function dayKey(sec: number): string {
   const d = new Date(sec * 1000);

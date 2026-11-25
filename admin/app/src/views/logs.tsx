@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Copy, RefreshCw, ScrollText, Search, Trash2 } from 'lucide-react';
-import { Badge, Button, Card, EmptyState, EngineBadge, Input, SkeletonRows, useToast } from '@/components/ui';
+import { Badge, Button, Card, EmptyState, EngineBadge, Input, MetricStrip, SkeletonRows, Verdict, useToast, type MetricItem } from '@/components/ui';
 import { useLang } from '@/lib/i18n';
 import { ENGINE_LABELS, ENGINES, clearLogs, engineLogs, type Engine, type LogRow } from '@/lib/api';
 
@@ -80,6 +80,23 @@ export default function LogsView() {
   const failed = logs.data?.failed ?? [];
   const selected = picked ?? rows[0] ?? null;
 
+  /** 面板结论：先回答「有没有事」，再让人决定要不要往下看表。 */
+  const errCount = rows.filter(function (r) { return TONE[levelOf(r.row)] === 'err'; }).length;
+  const warnCount = rows.filter(function (r) { return TONE[levelOf(r.row)] === 'warn'; }).length;
+  const metrics: MetricItem[] = [
+    { label: t('logs.metric.total'), value: String(rows.length), hint: t('logs.metric.totalHint') },
+    { label: t('logs.metric.err'), value: String(errCount), hint: errCount ? t('logs.metric.errHint') : t('logs.metric.errNone'), tone: errCount ? 'err' : 'ok' },
+    { label: t('logs.metric.warn'), value: String(warnCount), hint: warnCount ? t('logs.metric.warnHint') : t('logs.metric.warnNone'), tone: warnCount ? 'warn' : undefined },
+    { label: t('logs.metric.scope'), value: scope === 'all' ? t('engine.merge') : ENGINE_LABELS[scope], hint: t('logs.metric.scopeHint') },
+  ];
+  const verdict = logs.isPending
+    ? { tone: 'info' as const, text: t('state.loading') }
+    : errCount
+      ? { tone: 'err' as const, text: t('logs.verdict.err', { n: errCount }), detail: t('logs.verdict.errHint') }
+      : warnCount
+        ? { tone: 'warn' as const, text: t('logs.verdict.warn', { n: warnCount }), detail: t('logs.verdict.warnHint') }
+        : { tone: 'ok' as const, text: t('logs.verdict.ok') };
+
   function copy(text: string) {
     navigator.clipboard.writeText(text).then(function () { toast.push('ok', t('common.copied')); })
       .catch(function () { toast.push('err', t('common.copyFailed')); });
@@ -87,6 +104,8 @@ export default function LogsView() {
 
   return (
     <div className="flex flex-col gap-3">
+      <MetricStrip items={metrics} />
+      <Verdict tone={verdict.tone} text={verdict.text} detail={verdict.detail} />
       <div className="flex flex-wrap items-center gap-2">
         <div role="tablist" aria-label={t('engine.label')} className="flex gap-0.5 rounded-md border border-line-faint p-0.5">
           {(['all', ...ENGINES] as const).map(function (s) {

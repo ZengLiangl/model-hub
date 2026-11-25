@@ -4,6 +4,7 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { AlertTriangle, Brain, Boxes, Eye, RefreshCw, Search, Wrench } from 'lucide-react';
 import { Button, Card, EmptyState, EngineBadge, Input, SkeletonRows, TableWrap, Td, Th, Tr } from '@/components/ui';
 import { useLang } from '@/lib/i18n';
+import { fmtCompact } from '@/lib/format';
 import {
   ENGINE_LABELS, ENGINES, engineModels, hubHealth, type Engine, type ModelRow, type Realm,
 } from '@/lib/api';
@@ -27,9 +28,10 @@ function num(v: unknown): number | undefined {
 }
 
 function fmtNum(n?: number): string {
-  if (n === undefined) return "—";
-  if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "K";
-  return String(n);
+  // 模型页展示的是上下文窗口（96K / 300K / 1M）—— 这类数字的「单位」就是重点，
+  // 交给共享的 fmtCompact 统一口径（<1 万仍精确显示，避免 96000 缩成 96K 后
+  // 和 9600 混淆）。
+  return fmtCompact(n);
 }
 
 function toMerged(rows: ModelRow[], eng: Engine): MergedModel[] {

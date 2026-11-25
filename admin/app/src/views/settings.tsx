@@ -6,6 +6,7 @@ import {
 } from '@/components/ui';
 import { useLang } from '@/lib/i18n';
 import { settingLabel } from '@/lib/setting-labels';
+import { fmtInt } from '@/lib/format';
 import { UpdateCard } from '@/components/app/update';
 import {
   ENGINE_LABELS, ENGINES, changePanelPassword, engineSchedulerToggle, engineSettings, hubKeysDetail, hubSaveMerged, hubSettings,
@@ -51,7 +52,7 @@ function parseDraft(v: string): number | null {
 }
 
 function fmtNum(n: number): string {
-  return n.toLocaleString("en-US");
+  return fmtInt(n);
 }
 
 /** 护栏键名是后端配置里的原始标识；能给中文注解的就给（悬停可见），不新造词条。 */

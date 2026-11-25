@@ -6,7 +6,7 @@
  */
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Card, EngineBadge, SkeletonRows } from '@/components/ui';
+import { Card, EngineBadge, MetricStrip, SkeletonRows, Verdict, type MetricItem } from '@/components/ui';
 import { useLang } from '@/lib/i18n';
 import { ENGINES, ENGINE_LABELS, engineSettings, type ApiKey, type Engine } from '@/lib/api';
 import { EngineKeyCard, HubPanels } from './settings';
@@ -17,8 +17,32 @@ export default function KeysView() {
   const settings = useQuery({ queryKey: ["settings", engine], queryFn: function () { return engineSettings(engine); } });
   const rows = (settings.data?.api_keys ?? []) as ApiKey[];
 
+  /** 一把 Key 有没有事，只看三件：在用几把、停用几把、有没有配额度。 */
+  const enabled = rows.filter(function (k) { return k.enabled !== false; }).length;
+  const disabled = rows.length - enabled;
+  const withQuota = rows.filter(function (k) {
+    const q = Number((k as Record<string, unknown>).quota);
+    return Number.isFinite(q) && q > 0;
+  }).length;
+
+  const metrics: MetricItem[] = [
+    { label: t('keys.metric.total'), value: String(rows.length), hint: t('keys.metric.totalHint', { engine: ENGINE_LABELS[engine] }) },
+    { label: t('keys.metric.enabled'), value: String(enabled), hint: t('keys.metric.enabledHint'), tone: enabled ? 'ok' : 'warn' },
+    { label: t('keys.metric.disabled'), value: String(disabled), hint: disabled ? t('keys.metric.disabledHint') : t('keys.metric.disabledNone'), tone: disabled ? 'warn' : undefined },
+    { label: t('keys.metric.quota'), value: String(withQuota), hint: t('keys.metric.quotaHint') },
+  ];
+  const verdict = settings.isPending
+    ? { tone: 'info' as const, text: t('state.loading') }
+    : rows.length === 0
+      ? { tone: 'warn' as const, text: t('keys.verdict.empty', { engine: ENGINE_LABELS[engine] }), detail: t('keys.verdict.emptyHint') }
+      : enabled === 0
+        ? { tone: 'err' as const, text: t('keys.verdict.allDisabled', { engine: ENGINE_LABELS[engine] }), detail: t('keys.verdict.allDisabledHint') }
+        : { tone: 'ok' as const, text: t('keys.verdict.ok', { n: enabled }) };
+
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-3">
+      <MetricStrip items={metrics} />
+      <Verdict tone={verdict.tone} text={verdict.text} detail={verdict.detail} />
       <Card
         title={t("keys.engineTitle")}
         subtitle={t("keys.engineHint")}

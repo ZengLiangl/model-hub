@@ -42,6 +42,7 @@ function lazyWithReload(factory: () => Promise<{ default: ComponentType }>) {
 const OverviewView = lazyWithReload(() => import('@/views/overview'));
 const AccountsView = lazyWithReload(() => import('@/views/accounts'));
 const ModelsView = lazyWithReload(() => import('@/views/models'));
+const ModelPlazaView = lazyWithReload(() => import('@/views/model-plaza'));
 const MetricsView = lazyWithReload(() => import('@/views/metrics'));
 const RoutingView = lazyWithReload(() => import('@/views/routing'));
 const LogsView = lazyWithReload(() => import('@/views/logs'));
@@ -73,6 +74,7 @@ export default function Authenticated() {
               <Route path="/overview" element={<OverviewView />} />
               <Route path="/accounts" element={<AccountsView />} />
               <Route path="/models" element={<ModelsView />} />
+              <Route path="/plaza" element={<ModelPlazaView />} />
               <Route path="/metrics" element={<MetricsView />} />
               <Route path="/routing" element={<RoutingView />} />
             <Route path="/logs" element={<LogsView />} />

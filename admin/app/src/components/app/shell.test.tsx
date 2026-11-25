@@ -57,16 +57,19 @@ describe('AuthGate', () => {
 });
 
 describe('AppShell', () => {
-  it('已登录后渲染 10 个导航项，并高亮当前页', async () => {
+  it('已登录后导航项齐全（右面板的二级项 + 窄屏副本）', async () => {
     sessionStorage.setItem("hub-panel-token", "tk");
     mockFetch((url) => {
       if (url.includes("/health")) return json({ ok: true });
       return json({});
     });
     renderApp();
-    await waitFor(() => expect(screen.getAllByRole("link").length).toBeGreaterThanOrEqual(9));
+    // 双层导航下，右面板只显示**当前模块**的二级项（overview 属于 main）；
+    // 窄屏导航块在 navOpen=false 时不渲染，所以链接数 = main 组的项数。
+    await waitFor(() => expect(screen.getAllByRole("link").length).toBeGreaterThanOrEqual(5));
     const links = screen.getAllByRole("link");
-    expect(links.length).toBe(10);
+    // main 组：overview / accounts / models / plaza / metrics / routing
+    expect(links.length).toBe(6);
   });
 
   // 回归守卫：切换轮次里 App.tsx 曾被简化成不含 ToastProvider，
@@ -85,7 +88,6 @@ describe('AppShell', () => {
     await waitFor(() => expect(screen.getByText('alpha')).toBeInTheDocument(), { timeout: 5000 });
   });
 
-  // 胶囊三档：<1024 汉堡 / 1024–1151 FAB / >=1152 完整胶囊
   // 回归守卫：侧边栏版本号曾经是源码里的硬编码 "v1.0.0"，后端早已 1.1.0 ——
   // 面板自己先把版本说错了。现在取 /api/hub/health 的 version。
   it('侧边栏版本号来自后端 health.version（不是硬编码）', async () => {
@@ -102,27 +104,83 @@ describe('AppShell', () => {
     sessionStorage.setItem('hub-panel-token', 'tk');
     mockFetch((url) => (url.includes('/health') ? json({ ok: true, engines: {} }) : json({})));
     renderApp();
-    await waitFor(() => expect(document.querySelector('aside.nav-pill')).toBeTruthy(), { timeout: 5000 });
+    await waitFor(() => expect(document.querySelector('.ad-island')).toBeTruthy(), { timeout: 5000 });
     expect(document.body.textContent || '').not.toMatch(/v1\.0\.0/);
   });
 
-  it('胶囊三档：宽屏显示完整胶囊，不显示 FAB', async () => {
+  // ── 岛式外壳（控制台设计规范第一条）──────────────────────────────
+  it('外壳是浮在背景上的一块板：.ad-island 存在且承载全部内容', async () => {
     sessionStorage.setItem('hub-panel-token', 'tk');
     mockFetch((url) => (url.includes('/health') ? json({ ok: true, engines: {} }) : json({})));
     renderApp();
-    await waitFor(() => expect(document.querySelector('aside.nav-pill')).toBeTruthy(), { timeout: 5000 });
-    expect(document.querySelector('button.fab')).toBeNull();
+    const island = await waitFor(() => {
+      const el = document.querySelector('.ad-island');
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    }, { timeout: 5000 });
+    // 岛里必须真的有导航与内容，而不是一个空壳
+    expect(island.querySelectorAll('a[href]').length).toBeGreaterThan(0);
+    expect(island.querySelector('main')).toBeTruthy();
   });
 
-  it('胶囊三档：中等宽度（matchMedia 命中）只留 FAB', async () => {
-    const mq = { matches: true, media: '', onchange: null, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {}, dispatchEvent() { return false; } };
-    vi.stubGlobal('matchMedia', () => mq);
+  // ── 双层导航（规范第三条）：72 左轨 + 240 右面板 ──────────────────
+  it('双层导航：左轨只放图标、右面板放当前模块的二级项', async () => {
     sessionStorage.setItem('hub-panel-token', 'tk');
     mockFetch((url) => (url.includes('/health') ? json({ ok: true, engines: {} }) : json({})));
     renderApp();
-    await waitFor(() => expect(document.querySelector('button.fab')).toBeTruthy(), { timeout: 5000 });
-    expect(document.querySelector('aside.nav-pill')).toBeNull();
-    vi.unstubAllGlobals();
+    await waitFor(() => expect(document.querySelector('.ad-island')).toBeTruthy(), { timeout: 5000 });
+    // 一级模块是 button（不是 link），二级项才是 link。
+    // .rail-item 同时被主题按钮复用，所以总数是「三个分组 + 主题」= 4。
+    const railButtons = document.querySelectorAll('button.rail-item');
+    expect(railButtons.length).toBe(4);
+    // 其中 3 个是一级模块（Daily / Operations / Config），第 4 个是主题按钮
+    const titles = Array.from(railButtons).map(function (b) { return b.getAttribute('title') || ''; });
+    expect(titles.filter(function (x) { return /Daily|Operations|Config|日常|运维|配置/i.test(x); }).length).toBe(3);
+  });
+
+  // ── 顶栏已删除（规范第七条）：标签页取代面包屑 ────────────────────
+  it('不再有重复的顶栏面包屑：桌面下没有 header', async () => {
+    sessionStorage.setItem('hub-panel-token', 'tk');
+    mockFetch((url) => (url.includes('/health') ? json({ ok: true, engines: {} }) : json({})));
+    renderApp();
+    await waitFor(() => expect(document.querySelector('.ad-island')).toBeTruthy(), { timeout: 5000 });
+    // 唯一允许存在的 header 是窄屏那个（lg:hidden），桌面结构里不该有可见 header
+    const headers = Array.from(document.querySelectorAll('header'));
+    const desktopHeaders = headers.filter(function (h) {
+      return !(h.className || '').includes('lg:hidden');
+    });
+    expect(desktopHeaders.length).toBe(0);
+  });
+
+  // ── 状态一律用点（规范第六条）────────────────────────────────────
+  it('状态用圆点而不是色块', async () => {
+    sessionStorage.setItem('hub-panel-token', 'tk');
+    mockFetch((url) => (url.includes('/health') ? json({ ok: true, engines: {} }) : json({})));
+    renderApp();
+    await waitFor(() => expect(document.querySelector('.ad-island')).toBeTruthy(), { timeout: 5000 });
+    expect(document.querySelectorAll('.ad-dot').length).toBeGreaterThan(0);
+  });
+
+  // ── 主题三态（规范第八条）────────────────────────────────────────
+  it('主题按钮在 明/暗/跟随系统 之间循环', async () => {
+    sessionStorage.setItem('hub-panel-token', 'tk');
+    localStorage.setItem('hub-theme', 'light');
+    mockFetch((url) => (url.includes('/health') ? json({ ok: true, engines: {} }) : json({})));
+    renderApp();
+    await waitFor(() => expect(document.querySelector('.ad-island')).toBeTruthy(), { timeout: 5000 });
+    const btn = await waitFor(() => {
+      const el = document.querySelector('button[aria-label="明"]');
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    }, { timeout: 5000 });
+    await userEvent.click(btn);
+    // 明 -> 暗
+    await waitFor(() => expect(document.documentElement.getAttribute('data-theme')).toBe('dark'));
+    expect(localStorage.getItem('hub-theme')).toBe('dark');
+    // 暗 -> 跟随系统
+    const btn2 = document.querySelector('button[aria-label="暗"]') as HTMLElement;
+    await userEvent.click(btn2);
+    expect(localStorage.getItem('hub-theme')).toBe('system');
   });
 
   it('窄屏下点汉堡按钮出现移动端导航容器', async () => {

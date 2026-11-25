@@ -3,227 +3,301 @@ import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 
 const LOGO = (import.meta.env.BASE_URL || './') + 'logo.jpg';
-import { ChevronLeft, Menu, Moon, PanelLeft, Sun, X } from 'lucide-react';
+import { Menu, Monitor, Moon, Sun, X } from 'lucide-react';
+import { motion } from 'framer-motion';
 import { useLang } from '@/lib/i18n';
 import { hubHealth } from '@/lib/api';
 import { UpdateBanner } from '@/components/app/update';
-import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/cn';
 import { GROUP_LABEL, ROUTES, type RouteMeta } from '@/app/routes';
 import { NavItem } from './nav-item';
 import { RouteTransition } from './route-transition';
+import { TabBar } from './tab-bar';
 
 const THEME_KEY = 'hub-theme';
-const NAV_KEY = 'hub-nav-open';
+/** 三态：明 / 暗 / 跟随系统（规范第八条） */
+type ThemeMode = 'light' | 'dark' | 'system';
 
-function readTheme(): 'dark' | 'light' {
-  return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
-}
-/** 默认展开；用户收进去过就记住。 */
-function readOpen(): boolean {
-  try { return localStorage.getItem(NAV_KEY) !== '0'; } catch { return true; }
+function readThemeMode(): ThemeMode {
+  try {
+    const saved = localStorage.getItem(THEME_KEY);
+    if (saved === 'light' || saved === 'dark' || saved === 'system') return saved;
+  } catch { /* ignore */ }
+  return 'system';
 }
 
-function Group(props: { group: RouteMeta['group']; t: (k: string) => string; onNavigate?: () => void }) {
-  const items = ROUTES.filter(function (r) { return r.group === props.group; });
-  if (!items.length) return null;
+function applyTheme(mode: ThemeMode) {
+  const resolved = mode === 'system'
+    ? (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+    : mode;
+  document.documentElement.setAttribute('data-theme', resolved);
+}
+
+/** 一级模块：左轨的一个图标 */
+function RailItem(props: {
+  group: RouteMeta['group'];
+  label: string;
+  icon: typeof ROUTES[number]['icon'];
+  active: boolean;
+  onClick: () => void;
+  expanded: boolean;
+}) {
+  const Icon = props.icon;
   return (
-    <div className="flex flex-col gap-0.5">
-      <p className="px-2 pb-0.5 pt-2 text-[9.5px] font-medium uppercase tracking-[0.09em] text-fg-mute">
-        {props.t(GROUP_LABEL[props.group])}
-      </p>
-      {items.map(function (r) {
-        return <NavItem key={r.id} route={r} label={props.t(r.labelKey)} onNavigate={props.onNavigate} />;
-      })}
-    </div>
+    <button
+      type="button"
+      onClick={props.onClick}
+      aria-current={props.active ? 'true' : undefined}
+      title={props.label}
+      className={cn(
+        'rail-item relative flex h-10 w-full cursor-pointer items-center rounded-[8px] text-nav-fg',
+        'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent',
+        props.expanded ? 'gap-2.5 px-3' : 'justify-center',
+        props.active ? 'text-nav-fg-active' : 'hover:text-nav-fg-active',
+      )}
+      style={props.active ? { background: 'var(--nav-active-bg)' } : undefined}
+    >
+      {/* 强调条：整个界面里唯一的"当前"信号之一（另一处是二级项） */}
+      {props.active ? (
+        <motion.span
+          aria-hidden="true"
+          initial={{ scaleY: 0 }}
+          animate={{ scaleY: 1 }}
+          transition={{ duration: 0.26, ease: [0.16, 1, 0.3, 1] }}
+          className="absolute left-0 top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-full bg-accent"
+        />
+      ) : null}
+      <Icon size={17} aria-hidden="true" className={props.active ? 'opacity-100' : 'opacity-75'} />
+      {props.expanded ? <span className="truncate text-[12.5px]">{props.label}</span> : null}
+    </button>
   );
 }
 
 export function AppShell() {
   const lang = useLang();
   const t = lang.t;
-  const [theme, setTheme] = useState(readTheme);
-  const [open, setOpen] = useState(readOpen);
+  const [themeMode, setThemeMode] = useState<ThemeMode>(readThemeMode);
+  /** 左轨悬停展开：鼠标进轨道时展开到 216px 露出文字 */
+  const [railOpen, setRailOpen] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
-  /** 中等宽度（<1280）自动收成 FAB：胶囊太挤会显得局促，不如收起来 */
-  const [isNarrow, setIsNarrow] = useState(function () {
-    try { return window.matchMedia('(max-width: 1151px)').matches; } catch { return false; }
-  });
   const location = useLocation();
   const navigate = useNavigate();
 
-  /** 版本号取自后端 /api/hub/health（与总览同一份缓存），不再写死在源码里。
-   *  之前这里硬编码 "v1.0.0"，后端已经是 1.1.0，面板自己先把版本说错了。
-   *  取不到就只显示「喵枢」——宁可少一个版本号，也不显示一个错的。 */
   const health = useQuery({ queryKey: ['hub-health'], queryFn: hubHealth });
-  const version = health.data?.version ? ' · v' + health.data.version : '';
+  const version = health.data?.version ? 'v' + health.data.version : '';
 
+  /** 当前一级模块（决定右面板显示什么） */
+  const currentGroup = (function () {
+    const hit = ROUTES.find(function (r) { return location.pathname.startsWith(r.path); });
+    return hit ? hit.group : 'main';
+  })();
+  const panelItems = ROUTES.filter(function (r) { return r.group === currentGroup; });
   const current = ROUTES.find(function (r) { return location.pathname.startsWith(r.path); }) ?? ROUTES[0];
   const title = t(current.labelKey);
 
+  /** 主题：三态循环，系统态跟随系统变化实时响应 */
   useEffect(function () {
-    try { localStorage.setItem(NAV_KEY, open ? '1' : '0'); } catch { /* ignore */ }
-  }, [open]);
+    applyTheme(themeMode);
+    try { localStorage.setItem(THEME_KEY, themeMode); } catch { /* ignore */ }
+  }, [themeMode]);
 
   useEffect(function () {
-    if (typeof window.matchMedia !== 'function') return;
-    const mq = window.matchMedia('(max-width: 1151px)');
-    function onChange(e: MediaQueryListEvent) { setIsNarrow(e.matches); }
+    if (themeMode !== 'system' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    function onChange() { applyTheme('system'); }
     mq.addEventListener('change', onChange);
     return function () { mq.removeEventListener('change', onChange); };
-  }, []);
+  }, [themeMode]);
 
-  // ⌘/Ctrl + B 收放侧栏（编辑器的通用习惯）
-  useEffect(function () {
-    function onKey(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'b') {
-        e.preventDefault();
-        setOpen(function (v) { return !v; });
-      }
-    }
-    window.addEventListener('keydown', onKey);
-    return function () { window.removeEventListener('keydown', onKey); };
-  }, []);
-
-  function toggleTheme() {
-    const next = theme === 'dark' ? 'light' : 'dark';
-    document.documentElement.setAttribute('data-theme', next);
-    try { localStorage.setItem(THEME_KEY, next); } catch { /* ignore */ }
-    setTheme(next);
+  function cycleTheme() {
+    setThemeMode(function (m) { return m === 'light' ? 'dark' : m === 'dark' ? 'system' : 'light'; });
   }
+  const themeIcon = themeMode === 'light' ? <Sun size={14} /> : themeMode === 'dark' ? <Moon size={14} /> : <Monitor size={14} />;
+  const themeLabel = themeMode === 'light' ? '明' : themeMode === 'dark' ? '暗' : '跟随系统';
 
-  const nav = (
-    <nav aria-label={t('nav.title')} className="flex flex-col px-1.5 pb-1.5">
-      <Group group="main" t={t} onNavigate={function () { setNavOpen(false); }} />
-      <Group group="ops" t={t} onNavigate={function () { setNavOpen(false); }} />
-      <Group group="config" t={t} onNavigate={function () { setNavOpen(false); }} />
-    </nav>
-  );
+  const groups: RouteMeta['group'][] = ['main', 'ops', 'config'];
+  const groupIcon: Record<RouteMeta['group'], typeof ROUTES[number]['icon']> = {
+    main: ROUTES.find(function (r) { return r.group === 'main'; })!.icon,
+    ops: ROUTES.find(function (r) { return r.group === 'ops'; })!.icon,
+    config: ROUTES.find(function (r) { return r.group === 'config'; })!.icon,
+  };
 
   return (
-    <div className="min-h-dvh bg-canvas text-fg">
-      {/* ── 悬浮矮胶囊：内容多高它多高，垂直居中 ───────────────── */}
-      {open && !isNarrow ? (
-        <aside
-          className={cn(
-            'nav-pill fixed left-3 z-30 hidden max-h-[calc(100dvh-24px)] flex-col lg:flex',
-            'w-[208px] overflow-hidden rounded-2xl border border-line-faint bg-surface/85 shadow-2 backdrop-blur-xl lg:flex',
-          )}
+    <div className="ad-island">
+      {/* ══ 左侧导航：全页唯一的深色区 ═══════════════════════════ */}
+      <div className="hidden shrink-0 lg:flex">
+        {/* 左轨 72px：只放图标，悬停展开到 216px */}
+        <div
+          onMouseEnter={function () { setRailOpen(true); }}
+          onMouseLeave={function () { setRailOpen(false); }}
+          className="relative z-10 flex shrink-0 flex-col border-r border-white/5 bg-nav-bg transition-[width] duration-260"
+          style={{ width: railOpen ? 'var(--rail-open)' : 'var(--rail-w)', transitionTimingFunction: 'var(--ease)' }}
         >
-          {/* 品牌：主名称在上，喵枢 + 版本在下 */}
-          <div className="flex items-start gap-2 border-b border-line-faint/70 px-2.5 pb-2 pt-2.5">
-            <img src={LOGO} alt="" aria-hidden="true" className="logo-bob mt-0.5 h-7 w-7 shrink-0 rounded-[8px] object-cover ring-1 ring-line-faint" />
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-[12px] font-semibold leading-4 tracking-tight" title={t('app.name')}>
-                {t('app.name')}
-              </p>
-              <p className="truncate text-[10px] leading-4 text-fg-mute" title={t('app.name')}>
-                {t('app.short')}{version}
-              </p>
-            </div>
+          {/* 品牌 */}
+          <div className={cn('flex h-14 shrink-0 items-center', railOpen ? 'gap-2.5 px-3' : 'justify-center')}>
+            <img
+              src={LOGO}
+              alt=""
+              aria-hidden="true"
+              className="logo-bob h-8 w-8 shrink-0 rounded-[9px] object-cover ring-1 ring-white/10"
+            />
+            {railOpen ? (
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-[12.5px] font-semibold leading-4 text-nav-fg-active" title={t('app.name')}>
+                  {t('app.name')}
+                </p>
+                <p className="truncate text-[10px] leading-4 text-nav-fg" title={t('app.short')}>
+                  {t('app.short')} {version}
+                </p>
+              </div>
+            ) : null}
+          </div>
+
+          {/* 一级模块 */}
+          <div className={cn('flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto py-2', railOpen ? 'px-2' : 'px-2')}>
+            {groups.map(function (g, i) {
+              const active = currentGroup === g;
+              return (
+                <div key={g} className={i > 0 ? 'mt-6' : ''}>
+                  <RailItem
+                    group={g}
+                    label={t(GROUP_LABEL[g])}
+                    icon={groupIcon[g]}
+                    active={active}
+                    expanded={railOpen}
+                    onClick={function () {
+                      const first = ROUTES.find(function (r) { return r.group === g; });
+                      if (first) navigate(first.path);
+                      // 点完一级项，轨道**立刻收回**：展开状态会压住右面板，
+                      // 而"选择模块"这个动作已经完成，没有继续展开的理由。
+                      setRailOpen(false);
+                    }}
+                  />
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 底部：主题 + 语言 */}
+          <div className={cn('flex shrink-0 items-center gap-1 border-t border-white/5 py-2', railOpen ? 'px-2' : 'justify-center px-1')}>
             <button
-              onClick={function () { setOpen(false); }}
-              aria-label="收起导航"
-              title="收起导航（Ctrl/⌘ + B）"
-              className="icon-btn mt-0.5 grid h-6 w-6 shrink-0 cursor-pointer place-items-center rounded-md text-fg-mute"
+              type="button"
+              onClick={cycleTheme}
+              aria-label={themeLabel}
+              title={themeLabel}
+              className="rail-item grid h-8 w-8 shrink-0 cursor-pointer place-items-center rounded-[8px] text-nav-fg hover:text-nav-fg-active"
             >
-              <ChevronLeft size={13} />
+              {themeIcon}
             </button>
-          </div>
-
-          <div className="nav-scroll min-h-0 overflow-y-auto">{nav}</div>
-
-          <div className="flex items-center gap-1 border-t border-line-faint/70 px-1.5 py-1.5">
-            <Button variant="ghost" size="icon" onClick={toggleTheme} aria-label={t('theme.toggle')} title={t('theme.toggle')}>
-              {theme === 'dark' ? <Sun size={13} /> : <Moon size={13} />}
-            </Button>
-            <button
-              onClick={function () { lang.setLang(lang.lang === 'zh' ? 'en' : 'zh'); }}
-              className="icon-btn ml-auto h-7 cursor-pointer rounded-md px-2 text-[11px] text-fg-dim"
-            >
-              {lang.lang === 'zh' ? 'EN' : '中'}
-            </button>
-          </div>
-        </aside>
-      ) : (
-        /* 收进去（或中等宽度自动收）之后：只留一枚贴边的圆形按钮 */
-        <button
-          onClick={function () { setOpen(true); }}
-          aria-label="展开导航"
-          title="展开导航（Ctrl/⌘ + B）"
-          className={cn(
-            'fab fixed left-3 z-30 hidden h-11 w-11 place-items-center rounded-full lg:grid',
-            'border border-line-faint bg-surface/90 shadow-2 backdrop-blur-xl lg:grid',
-          )}
-        >
-          <PanelLeft size={16} />
-        </button>
-      )}
-
-      {/* ── 主区域 ─────────────────────────────────────────── */}
-      <div className={cn('flex min-h-dvh min-w-0 flex-col transition-[padding] duration-250 ease-[cubic-bezier(0.22,1,0.36,1)]', open && !isNarrow ? 'lg:pl-[228px]' : 'lg:pl-[72px]')}>
-        <header className="sticky top-0 z-20 border-b border-line-faint bg-canvas">
-          <div className="flex h-12 items-center gap-2 px-3 sm:px-4">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="lg:hidden"
-              aria-label={navOpen ? '关闭导航' : '打开导航'}
-              aria-expanded={navOpen}
-              onClick={function () { setNavOpen(function (v) { return !v; }); }}
-            >
-              {navOpen ? <X size={16} /> : <Menu size={16} />}
-            </Button>
-            <img src={LOGO} alt="" aria-hidden="true" className="h-5 w-5 rounded-[5px] object-cover lg:hidden" />
-            <span className="hidden items-center gap-1.5 text-[11px] text-fg-mute sm:flex">
-              <span className="max-w-[220px] truncate">{t('app.name')}</span>
-              <span className="text-line-strong">/</span>
-            </span>
-            <h1 className="min-w-0 truncate text-[13px] font-semibold">{title}</h1>
-            <div className="ml-auto flex items-center gap-1 lg:hidden">
-              <Button variant="ghost" size="icon" onClick={toggleTheme} aria-label={t('theme.toggle')}>
-                {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
-              </Button>
-            </div>
-          </div>
-        </header>
-        {/* 顶栏主标签（CPAMC 形态）：一级导航平铺在页头，二级仍在侧栏。 */}
-        <nav className="cp-tabs border-b border-line-faint bg-canvas px-3 sm:px-4" aria-label={t('app.panel')}>
-          {(["main", "ops", "config"] as const).map(function (g) {
-            const first = ROUTES.find(function (r) { return r.group === g; });
-            const active = ROUTES.some(function (r) { return r.group === g && location.pathname.startsWith(r.path); });
-            if (!first) return null;
-            return (
+            {railOpen ? (
               <button
-                key={g}
                 type="button"
-                className="cp-tab"
-                data-active={active ? 'true' : 'false'}
-                onClick={function () { navigate(first.path); }}
+                onClick={function () { lang.setLang(lang.lang === 'zh' ? 'en' : 'zh'); }}
+                className="rail-item ml-auto h-8 cursor-pointer rounded-[8px] px-2.5 text-[11px] text-nav-fg hover:text-nav-fg-active"
               >
-                {t(GROUP_LABEL[g])}
+                {lang.lang === 'zh' ? 'EN' : '中'}
               </button>
-            );
-          })}
-        </nav>
+            ) : null}
+          </div>
+        </div>
+
+        {/* 右面板 240px：当前模块的二级菜单，独立滚动，底部固定用户信息 */}
+        <div
+          className="flex shrink-0 flex-col border-r border-line-faint bg-surface-2/40"
+          style={{ width: 'var(--panel-w)' }}
+        >
+          <div className="flex h-14 shrink-0 items-center px-4">
+            <p className="truncate text-[12px] font-semibold tracking-tight text-fg">{t(GROUP_LABEL[currentGroup])}</p>
+          </div>
+          <nav aria-label={t('nav.title')} className="nav-scroll min-h-0 flex-1 overflow-y-auto px-2 pb-2">
+            <div className="flex flex-col gap-1">
+              {panelItems.map(function (r) {
+                return (
+                  <NavItem
+                    key={r.id}
+                    route={r}
+                    label={t(r.labelKey)}
+                    onNavigate={function () { setNavOpen(false); }}
+                  />
+                );
+              })}
+            </div>
+          </nav>
+          <div className="flex shrink-0 items-center gap-2 border-t border-line-faint px-3 py-2.5">
+            <span
+              className="ad-dot"
+              style={{ background: health.data?.ok === false ? 'var(--err)' : 'var(--ok)' }}
+              aria-hidden="true"
+            />
+            <span className="min-w-0 flex-1 truncate text-[11px] text-fg-mute">
+              {t('engine.online', { up: '—', total: '3' }).split(' ')[0]} {version}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* ══ 主区域 ═══════════════════════════════════════════════ */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        {/* 窄屏顶栏（桌面下不需要：标题已在标签上、面板高亮上） */}
+        <header className="flex h-12 shrink-0 items-center gap-2 border-b border-line-faint px-3 lg:hidden">
+          <button
+            type="button"
+            aria-label={navOpen ? '关闭导航' : '打开导航'}
+            aria-expanded={navOpen}
+            onClick={function () { setNavOpen(function (v) { return !v; }); }}
+            className="icon-btn grid h-8 w-8 cursor-pointer place-items-center rounded-[8px] text-fg-dim"
+          >
+            {navOpen ? <X size={16} /> : <Menu size={16} />}
+          </button>
+          <img src={LOGO} alt="" aria-hidden="true" className="h-5 w-5 rounded-[5px] object-cover" />
+          <h1 className="min-w-0 truncate text-[13px] font-semibold">{title}</h1>
+          <button
+            type="button"
+            onClick={cycleTheme}
+            aria-label={themeLabel}
+            className="icon-btn ml-auto grid h-8 w-8 cursor-pointer place-items-center rounded-[8px] text-fg-dim"
+          >
+            {themeIcon}
+          </button>
+        </header>
 
         {navOpen ? (
-          <div className="border-b border-line-faint bg-surface lg:hidden" data-mobile-nav="1">
-            <div className="flex h-10 items-center gap-2 px-3">
+          <div className="border-b border-line-faint bg-nav-bg px-2 py-2 lg:hidden" data-mobile-nav="1">
+            <div className="flex items-center gap-2 px-2 pb-2">
               <img src={LOGO} alt="" aria-hidden="true" className="h-6 w-6 rounded-[6px] object-cover" />
               <div className="min-w-0">
-                <p className="truncate text-[12px] font-semibold leading-4">{t('app.name')}</p>
-                <p className="truncate text-[10px] leading-4 text-fg-mute">{t('app.short')}</p>
+                <p className="truncate text-[12px] font-semibold leading-4 text-nav-fg-active">{t('app.name')}</p>
+                <p className="truncate text-[10px] leading-4 text-nav-fg">{t('app.short')} {version}</p>
               </div>
             </div>
-            {nav}
+            <nav aria-label={t('nav.title')} className="flex flex-col gap-1">
+              {groups.map(function (g) {
+                const items = ROUTES.filter(function (r) { return r.group === g; });
+                if (!items.length) return null;
+                return (
+                  <div key={g} className="flex flex-col gap-1">
+                    <p className="px-2 pt-2 pb-1 text-[9.5px] font-medium uppercase tracking-[0.09em] text-nav-fg">
+                      {t(GROUP_LABEL[g])}
+                    </p>
+                    {items.map(function (r) {
+                      return (
+                        <NavItem key={r.id} route={r} label={t(r.labelKey)} onNavigate={function () { setNavOpen(false); }} />
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </nav>
           </div>
         ) : null}
 
-        <main className="@container min-w-0 flex-1 px-3 py-3 sm:px-4 sm:py-4">
+        {/* 标签页取代面包屑：访问过的页面变成一条可关闭的标签 */}
+        <TabBar />
+
+        <main className="@container min-w-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
           <RouteTransition>
             <UpdateBanner t={t} />
-          <Outlet />
+            <Outlet />
           </RouteTransition>
         </main>
       </div>

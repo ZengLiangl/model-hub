@@ -5,28 +5,52 @@ import { AlertTriangle, RefreshCw, Users } from 'lucide-react';
 import { Button, Card, EmptyState, EngineBadge, SkeletonRows } from '@/components/ui';
 import { AreaChart, BarChart, Donut, Sparkline } from '@/components/charts';
 import { useLang } from '@/lib/i18n';
-import { ENGINE_LABELS, ENGINES, engineLogs, engineRecentUsage, engineUsage, fanout, hubHealth, type Engine, type LogRow, type RecentRequestRow } from '@/lib/api';
+import { ENGINE_LABELS, ENGINES, engineLogs, engineRecentUsage, engineUsage, fanout, hubCooldowns, hubHealth, type Engine, type LogRow, type RecentRequestRow } from '@/lib/api';
 import { bucketSeries, ratio } from '@/lib/series';
+import { fmtCompact, fmtClock, fmtDuration, fmtInt, fmtMoney, fmtTokens } from '@/lib/format';
 
-function fmt(n: number | undefined): string {
-  if (n === undefined || n === null || !Number.isFinite(n)) return '—';
-  return n.toLocaleString('en-US');
-}
+/** 紧凑计数（K/M/B）：图表轴与提示用 */
+const fmt = fmtCompact;
+/** 精确千分位：需要逐位读准的地方（请求数、账号数）仍用这个 */
+const fmtExact = fmtInt;
+const money = fmtMoney;
 
-function money(n: number | undefined): string {
-  if (n === undefined || !Number.isFinite(n)) return '—';
-  return '¥' + n.toFixed(2);
-}
-
-/** 一格 KPI：标签 / 主数字 / 备注，克制到只有这三层信息 */
-function Kpi(props: { label: string; value: string; hint?: string; tone?: 'err' }) {
+/** 一格 KPI：标签 / 主数字 / 备注，克制到只有这三层信息。
+ *
+ * 加了两个「看得见」的东西（对齐 workbuddy2api-hub 面板的做法）：
+ *   · trend：底部迷你趋势线 —— 数字在涨还是在跌，一眼就有判断；
+ *   · title：悬停给精确值 —— 紧凑显示（1.23M）会丢低位，逐位核对时不必换页。
+ * 两者都可选：没有时序数据时不画线，不留空白占位。
+ */
+function Kpi(props: {
+  label: string;
+  value: string;
+  hint?: string;
+  tone?: 'err';
+  title?: string;
+  trend?: number[];
+  trendTone?: string;
+}) {
   return (
     <div className="rounded-lg border border-line-faint bg-surface px-3.5 py-3">
       <p className="text-[11px] text-fg-mute">{props.label}</p>
-      <p className={'mt-1 text-[21px] font-semibold leading-7 tnum ' + (props.tone === 'err' ? 'text-err' : 'text-fg')}>
+      <p
+        title={props.title}
+        className={'mt-1 text-[21px] font-semibold leading-7 tnum ' + (props.tone === 'err' ? 'text-err' : 'text-fg')}
+      >
         {props.value}
       </p>
       {props.hint ? <p className="mt-0.5 truncate text-[11px] text-fg-mute">{props.hint}</p> : null}
+      {props.trend && props.trend.length > 1 ? (
+        <div className="mt-1.5 -mx-0.5">
+          <Sparkline
+            data={props.trend}
+            height={22}
+            tone={props.trendTone ?? (props.tone === 'err' ? 'err' : 'accent')}
+            ariaLabel={props.label}
+          />
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -36,6 +60,9 @@ export default function OverviewView() {
   const navigate = useNavigate();
 
   const health = useQuery({ queryKey: ['hub-health'], queryFn: hubHealth });
+  /** 模型冷却：引擎记着的上游限流窗口。放在总览最上面 ——
+   *  它解释了两件用户最容易困惑的事：为什么某个模型现在不通、什么时候会好。 */
+  const cooldowns = useQuery({ queryKey: ['hub-cooldowns'], queryFn: () => hubCooldowns(), refetchInterval: 60000 });
   // 总览统计必须跨区域：引擎默认只报「当前区域」，账号在 cn、引擎跑在 intl 时
   // 成功请求会被过滤成 0，只剩失败数，看起来像统计坏了。
   const usage = useQuery({ queryKey: ['overview-usage'], queryFn: () => fanout(async (eng: Engine) => engineUsage(eng, 'all')) });
@@ -83,6 +110,17 @@ export default function OverviewView() {
   }, [engines]);
 
   const series = useMemo(() => bucketSeries((logs.data?.rows ?? []).map(function (r) { return r.row; }), 24), [logs.data]);
+
+  /** 失败请求的分桶序列：给「失败」KPI 一条自己的趋势线。
+   *
+   * 用和主图同一个分桶器（24 桶），所以两条线的横轴口径一致 —— 用户能直接
+   * 对照「总流量涨了」和「失败也涨了」是不是同一段时间。 */
+  const errorSeries = useMemo(function () {
+    const rows = (logs.data?.rows ?? [])
+      .filter(function (x) { return Number(x.row.status ?? 0) >= 400 || x.row.error === true; })
+      .map(function (x) { return x.row; });
+    return bucketSeries(rows, 24).counts;
+  }, [logs.data]);
 
   /** 每引擎一条迷你曲线：同一时间窗分桶，方便横向比较谁在忙 */
   const perEngineSeries = useMemo(function () {
@@ -141,7 +179,11 @@ export default function OverviewView() {
   }, [recent.data]);
 
   const failed = Array.from(new Set([...(usage.data?.failed ?? []), ...(logs.data?.failed ?? [])]));
-  const usageAllFailed = (usage.data?.failed?.length ?? 0) === ENGINES.length;
+  /** 冷却列表：按剩余时间升序（快好的排前面，最值得等） */
+  const coolList = useMemo(function () {
+    const rows = cooldowns.data?.cooldowns ?? [];
+    return rows.slice().sort(function (a, b) { return a.seconds_left - b.seconds_left; });
+  }, [cooldowns.data]);  const usageAllFailed = (usage.data?.failed?.length ?? 0) === ENGINES.length;
   const allFailed = health.isError || usageAllFailed;
   const loading = usage.isPending || health.isPending;
   // requests 是「成功」计数，errors 是「失败」计数；总尝试数 = 两者之和。
@@ -208,18 +250,74 @@ export default function OverviewView() {
 
       {/* KPI 条 */}
       <div className="grid gap-3 @lg:grid-cols-2 @3xl:grid-cols-4">
-        <Kpi label={t('overview.kpi.requests')} value={fmt(attempts)} hint={t('engine.online', { up: String(ENGINES.filter(function (e) { return engines[e] && engines[e].ok !== false; }).length), total: String(ENGINES.length) })} />
+        <Kpi
+          label={t('overview.kpi.requests')}
+          value={fmtExact(attempts)}
+          trend={series.counts}
+          trendTone="accent"
+          hint={t('engine.online', { up: String(ENGINES.filter(function (e) { return engines[e] && engines[e].ok !== false; }).length), total: String(ENGINES.length) })}
+        />
         <Kpi
           label={t('overview.kpi.errors')}
-          value={fmt(totals.errors)}
+          value={fmtExact(totals.errors)}
+          trend={errorSeries}
+          trendTone="err"
           hint={successRate === undefined
             ? t('overview.kpi.errorsHint')
             : t('metrics.successRate') + ' ' + successRate.toFixed(1) + '% · ' + t('overview.kpi.errorsHint')}
           tone={totals.errors > 0 ? 'err' : undefined}
         />
-        <Kpi label={t('overview.kpi.tokens')} value={fmt(totals.tokens)} hint={t('overview.pool.ready') + ' ' + fmt(accountTotals.ready) + ' / ' + fmt(accountTotals.total)} />
-        <Kpi label={t('overview.kpi.cost')} value={totals.cost > 0 ? money(totals.cost) : t('overview.kpi.noPricing')} hint={totals.credit > 0 ? t('overview.kpi.credits') + ' ' + fmt(totals.credit) : undefined} />
+        <Kpi
+          label={t('overview.kpi.tokens')}
+          value={fmtTokens(totals.tokens)}
+          /* 紧凑显示会丢低位（1,234,567 → 1.23M），所以精确值挂在 title 上：
+             要逐位核对时悬停即可，不用再去指标页翻。 */
+          title={fmtExact(totals.tokens) + ' tokens'}
+          hint={t('overview.pool.ready') + ' ' + fmtExact(accountTotals.ready) + ' / ' + fmtExact(accountTotals.total)}
+        />
+        <Kpi label={t('overview.kpi.cost')} value={totals.cost > 0 ? money(totals.cost) : t('overview.kpi.noPricing')} hint={totals.credit > 0 ? t('overview.kpi.credits') + ' ' + fmtCompact(totals.credit) : undefined} />
       </div>
+
+      {/* 模型冷却：有就显示，没有就整块不出现（不留空占位）。
+          这块的价值是「解释」而不是「报警」：它告诉用户某个模型现在为什么不通、
+          什么时候会好 —— 而这两件事以前只能靠翻引擎日志才能知道。 */}
+      {coolList.length > 0 ? (
+        <div className="rounded-lg border border-warn/35 bg-warn-soft px-3 py-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="flex items-center gap-1.5 text-[11.5px] font-medium text-warn">
+              <AlertTriangle size={13} className="shrink-0" aria-hidden="true" />
+              {t('overview.cooldown.title')} · {coolList.length}
+            </p>
+            <p className="text-[10.5px] text-fg-mute">{t('overview.cooldown.hint')}</p>
+          </div>
+          <ul className="mt-1.5 flex flex-col gap-1">
+            {coolList.slice(0, 5).map(function (c, i) {
+              // 进度条按「已等待 / 总窗口」画：窗口总长用 until - (until - left) 推不出来，
+              // 所以只用剩余量做相对刻度（最长的那个占满），比较的是「谁快好了」。
+              const longest = Math.max.apply(null, coolList.map(function (x) { return x.seconds_left; })) || 1;
+              const width = Math.max(4, Math.round((c.seconds_left / longest) * 100));
+              return (
+                <li key={i} className="flex items-center gap-2 text-[11px]">
+                  <EngineBadge engine={c.engine} className="shrink-0" />
+                  <span className="min-w-0 flex-1 truncate font-mono text-fg-dim" title={c.model}>{c.model}</span>
+                  <span className="shrink-0 text-fg-mute">{c.realm}</span>
+                  {/* 剩余时长的横向刻度：长度=相对谁更久，数字=还要等多久 */}
+                  <span className="hidden h-1 w-16 shrink-0 overflow-hidden rounded-full bg-line-faint @lg:block">
+                    <span className="block h-full rounded-full bg-warn" style={{ width: width + '%' }} />
+                  </span>
+                  <span className="w-[72px] shrink-0 text-right tnum text-warn" title={fmtClock(c.until)}>
+                    {fmtDuration(c.seconds_left)}
+                  </span>
+                  <span className="w-[52px] shrink-0 text-right tnum text-fg-mute">{fmtClock(c.until)}</span>
+                </li>
+              );
+            })}
+          </ul>
+          {coolList.length > 5 ? (
+            <p className="mt-1 text-[10.5px] text-fg-mute">+{coolList.length - 5}</p>
+          ) : null}
+        </div>
+      ) : null}
 
       {/* 图表区 */}
       <div className="grid gap-3 @3xl:grid-cols-[minmax(0,1.9fr)_minmax(0,1fr)]">
@@ -246,8 +344,8 @@ export default function OverviewView() {
               ariaLabel={t('metrics.successRate')}
             />
             <ul className="flex flex-col gap-1.5 text-[11.5px]">
-              <li className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full" style={{ background: 'var(--accent-2)' }} />{t('common.ok')} <span className="tnum text-fg-mute">{fmt(totals.requests)}</span></li>
-              <li className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full" style={{ background: 'var(--err)' }} />{t('common.error')} <span className="tnum text-fg-mute">{fmt(totals.errors)}</span></li>
+              <li className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full" style={{ background: 'var(--accent-2)' }} />{t('common.ok')} <span className="tnum text-fg-mute">{fmtExact(totals.requests)}</span></li>
+              <li className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full" style={{ background: 'var(--err)' }} />{t('common.error')} <span className="tnum text-fg-mute">{fmtExact(totals.errors)}</span></li>
             </ul>
           </div>
         </Card>
@@ -325,7 +423,10 @@ export default function OverviewView() {
                 <Sparkline data={perEngineSeries[eng] ?? []} height={26} ariaLabel={ENGINE_LABELS[eng] + ' 24h'} tone={tone} />
                 <div className="flex items-center justify-between text-[10px] text-fg-mute">
                   <span className="font-mono">{String(info?.version || '—')}</span>
-                  <span className="tnum">{t('logs.col.tokens')} {fmt(Number((usage.data?.values?.[eng] as Record<string, number> | undefined)?.total_tokens) || 0)}</span>
+                  <span
+                    className="tnum"
+                    title={fmtExact(Number((usage.data?.values?.[eng] as Record<string, number> | undefined)?.total_tokens) || 0) + ' tokens'}
+                  >{t('logs.col.tokens')} {fmtTokens(Number((usage.data?.values?.[eng] as Record<string, number> | undefined)?.total_tokens) || 0)}</span>
                 </div>
               </div>
             );

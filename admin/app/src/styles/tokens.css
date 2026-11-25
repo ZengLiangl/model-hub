@@ -2,124 +2,173 @@
 @import "./cpamc.css";
 
 /* ==================================================================
- * 设计令牌 —— 参照 Linear / Vercel / Stripe 的产品界面语言：
- *   · 暗色是「近黑冷调」而不是中灰，靠层次而不是描边区分块面
- *   · 强调色只给主操作与当前项，其余用中性灰阶
- *   · 圆角克制（6/8/12），字号基准 13px，行高 1.5，信息密度优先
- *   · 组件里零硬编码颜色，一律走这些变量
+ * 设计令牌 —— 控制台形态：**浮在背景上的一块板**（不是铺满屏幕的网页）
+ *
+ *   · 全页浅色，唯一的深色是左侧导航（视觉锚点，告诉你"我在哪一层"）
+ *   · 全站一个强调色：琥珀。绿色只给成功、红色只给危险
+ *   · 数值从固定集合里取，不许自由发挥（见下面的 --sp-* / --r-* / --ease）
+ *   · 强调色上的文字**跟着底色翻转**（浅色模式白字、深色模式深字）——
+ *     这是可读性计算，不是审美偏好
  * ================================================================== */
 
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
+/* 浅色是**默认**（不带 data-theme 也走这套）。深色只覆盖必要的那几项。 */
 :root,
-[data-theme="dark"] {
-  color-scheme: dark;
-
-  /* 暖炭灰：与浅色纸质调同源，避免"性冷淡灰" */
-  --canvas: oklch(17.6% 0.008 75);
-  --surface: oklch(21.2% 0.009 75);
-  --surface-2: oklch(25.2% 0.011 75);
-  --overlay: oklch(28.4% 0.012 75);
-
-  --fg: oklch(94% 0.006 80);
-  --fg-dim: oklch(76% 0.008 80);
-  --fg-mute: oklch(62% 0.01 80);
-  --fg-invert: oklch(18% 0.01 75);
-
-  --line-faint: oklch(27.5% 0.009 75);
-  --line: oklch(33% 0.011 75);
-  --line-strong: oklch(44% 0.013 75);
-
-  /* 赭红 #a14427 在暗底提亮；橄榄绿与雾紫作次级强调 */
-  --accent: oklch(64% 0.135 38);
-  --accent-2: oklch(64% 0.09 140);
-  --accent-3: oklch(66% 0.07 312);
-  --accent-fg: oklch(99% 0.004 80);
-  --accent-soft: oklch(64% 0.135 38 / 0.16);
-  --accent-2-soft: oklch(64% 0.09 140 / 0.16);
-  --accent-3-soft: oklch(66% 0.07 312 / 0.16);
-
-  /* 三家引擎的识别色（暗色下统一提亮，保证小尺寸图形也认得出来） */
-  --brand-wb: oklch(66% 0.13 250);
-  --brand-qd: oklch(70% 0.11 190);
-  --brand-trae: oklch(72% 0.14 45);
-
-  --ok: oklch(72% 0.1 145);
-  --ok-soft: oklch(72% 0.1 145 / 0.15);
-  --warn: oklch(78% 0.12 75);
-  --warn-soft: oklch(78% 0.12 75 / 0.15);
-  --err: oklch(70% 0.15 30);
-  --err-soft: oklch(70% 0.15 30 / 0.15);
-  --info: oklch(72% 0.07 240);
-  --info-soft: oklch(72% 0.07 240 / 0.15);
-
-  --danger-bg: oklch(54% 0.16 30);
-  --danger-fg: oklch(99% 0.004 80);
-  --danger-bg-hover: oklch(58% 0.16 30);
-
-  --shadow-1: 0 1px 1px oklch(0% 0 0 / 0.3);
-  --shadow-2: 0 10px 28px -14px oklch(0% 0 0 / 0.72), 0 2px 6px -3px oklch(0% 0 0 / 0.5);
-  --shadow-3: 0 28px 64px -24px oklch(0% 0 0 / 0.86), 0 10px 22px -12px oklch(0% 0 0 / 0.6);
-}
-
 [data-theme="light"] {
   color-scheme: light;
 
-  /* 纸质暖调（取自 wb 看板：#efebe0 / #ffffff / #a14427） */
-  --canvas: oklch(93.8% 0.012 85);
-  --surface: oklch(100% 0 0);
-  --surface-2: oklch(91.8% 0.014 85);
-  --overlay: oklch(100% 0 0);
+  /* 岛外的背景：极淡纵向渐变，让岛有"落"的地方 */
+  --canvas: #eef0ec;
+  --canvas-to: #f4f5f2;
+  --surface: #ffffff;
+  --surface-2: #f6f7f5;
+  --overlay: #ffffff;
 
-  --fg: oklch(24% 0.008 80);
-  --fg-dim: oklch(46% 0.01 80);
-  --fg-mute: oklch(58% 0.012 80);
-  --fg-invert: oklch(99% 0.004 80);
+  --fg: #1a1d1b;
+  --fg-dim: #4b514d;
+  --fg-mute: #7c837e;
+  --fg-invert: #ffffff;
 
-  --line-faint: oklch(89.5% 0.014 85);
-  --line: oklch(85% 0.016 85);
-  --line-strong: oklch(79% 0.018 85);
+  --line-faint: #e8eae6;
+  --line: #dcdfd9;
+  --line-strong: #c4c8c1;
 
-  --accent: oklch(47% 0.14 35);
-  --accent-2: oklch(47% 0.09 140);
-  --accent-3: oklch(48% 0.06 312);
-  --accent-fg: oklch(100% 0 0);
-  --accent-soft: oklch(47% 0.14 35 / 0.1);
-  --accent-2-soft: oklch(47% 0.09 140 / 0.1);
-  --accent-3-soft: oklch(48% 0.06 312 / 0.1);
+  /* 琥珀：浅底上要够重才读得清 */
+  --accent: #b8862b;
+  --accent-2: #4a7c59;
+  --accent-3: #7a6a94;
+  --accent-fg: #ffffff;
+  --accent-soft: rgb(184 134 43 / 0.1);
+  --accent-2-soft: rgb(74 124 89 / 0.1);
+  --accent-3-soft: rgb(122 106 148 / 0.1);
 
-  --brand-wb: oklch(55% 0.14 250);
-  --brand-qd: oklch(56% 0.11 190);
-  --brand-trae: oklch(60% 0.15 45);
-  --ok: oklch(47% 0.09 140);
-  --ok-soft: oklch(47% 0.09 140 / 0.12);
-  --warn: oklch(53% 0.11 70);
-  --warn-soft: oklch(53% 0.11 70 / 0.14);
-  --err: oklch(50% 0.15 30);
-  --err-soft: oklch(50% 0.15 30 / 0.1);
-  --info: oklch(46% 0.08 240);
-  --info-soft: oklch(46% 0.08 240 / 0.1);
+  --brand-wb: #3f6fa8;
+  --brand-qd: #2f7f88;
+  --brand-trae: #a86a2b;
 
-  --danger-bg: oklch(50% 0.15 30);
-  --danger-fg: oklch(100% 0 0);
-  --danger-bg-hover: oklch(46% 0.15 30);
+  --ok: #3f7a52;
+  --ok-soft: rgb(63 122 82 / 0.11);
+  --warn: #9a6f1e;
+  --warn-soft: rgb(154 111 30 / 0.12);
+  --err: #b0453a;
+  --err-soft: rgb(176 69 58 / 0.1);
+  --info: #3d6b96;
+  --info-soft: rgb(61 107 150 / 0.1);
 
-  --shadow-1: 0 1px 2px oklch(30% 0.02 80 / 0.06);
-  --shadow-2: 0 8px 24px -12px oklch(30% 0.02 80 / 0.18), 0 2px 6px -3px oklch(30% 0.02 80 / 0.08);
-  --shadow-3: 0 24px 56px -20px oklch(30% 0.02 80 / 0.24), 0 8px 18px -10px oklch(30% 0.02 80 / 0.1);
+  --danger-bg: #b0453a;
+  --danger-fg: #ffffff;
+  --danger-bg-hover: #9c3b31;
+
+  /* 左侧导航的深色（全页唯一的深色区） */
+  --nav-bg: #14171a;
+  --nav-fg: rgb(232 234 236 / 0.55);
+  --nav-fg-active: #ffffff;
+  --nav-active-bg: rgb(255 255 255 / 0.09);
+
+  /* 岛的亮边 + 双层淡阴影（大扩散 + 近距离贴地）。
+     亮边是关键：没有它浅色岛在浅色背景上会糊成一片。 */
+  --island-edge: rgb(255 255 255 / 0.9);
+  --island-shadow: 0 24px 60px -28px rgb(24 30 26 / 0.22), 0 3px 10px -4px rgb(24 30 26 / 0.1);
+
+  --shadow-1: 0 1px 2px rgb(30 36 32 / 0.06);
+  --shadow-2: 0 8px 24px -12px rgb(30 36 32 / 0.18), 0 2px 6px -3px rgb(30 36 32 / 0.08);
+  --shadow-3: 0 24px 56px -20px rgb(30 36 32 / 0.24), 0 8px 18px -10px rgb(30 36 32 / 0.1);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* 深色不是把浅色取反，是另一套语义（见文件头） */
+  --canvas: #1b1e1c;
+  --canvas-to: #202422;
+  --surface: #232725;
+  --surface-2: #2a2f2c;
+  --overlay: #2c312e;
+
+  --fg: #e8eae7;
+  --fg-dim: #b3b8b3;
+  --fg-mute: #8a918c;
+  --fg-invert: #14171a;
+
+  --line-faint: #2f3431;
+  --line: #3a403c;
+  --line-strong: #4e5550;
+
+  /* 亮琥珀：深底上要够亮 */
+  --accent: #d9a441;
+  --accent-2: #7fae8c;
+  --accent-3: #a494bd;
+  /* ★ 强调色上的文字跟着底色翻转：深色模式下用深字压亮琥珀 */
+  --accent-fg: #14171a;
+  --accent-soft: rgb(217 164 65 / 0.16);
+  --accent-2-soft: rgb(127 174 140 / 0.16);
+  --accent-3-soft: rgb(164 148 189 / 0.16);
+
+  --brand-wb: #6f9fd8;
+  --brand-qd: #5cb3bd;
+  --brand-trae: #d19a5c;
+
+  --ok: #7fae8c;
+  --ok-soft: rgb(127 174 140 / 0.16);
+  --warn: #d9b062;
+  --warn-soft: rgb(217 176 98 / 0.16);
+  --err: #d97b6f;
+  --err-soft: rgb(217 123 111 / 0.16);
+  --info: #7fa6cc;
+  --info-soft: rgb(127 166 204 / 0.16);
+
+  --danger-bg: #a84a3e;
+  --danger-fg: #ffffff;
+  --danger-bg-hover: #bb5446;
+
+  /* 深色模式下导航仍然更深一层，否则锚失效 */
+  --nav-bg: #0f1113;
+  --nav-fg: rgb(232 234 236 / 0.5);
+  --nav-fg-active: #ffffff;
+  --nav-active-bg: rgb(255 255 255 / 0.08);
+
+  --island-edge: rgb(255 255 255 / 0.07);
+  --island-shadow: 0 28px 64px -30px rgb(0 0 0 / 0.72), 0 4px 12px -6px rgb(0 0 0 / 0.5);
+
+  --shadow-1: 0 1px 1px rgb(0 0 0 / 0.3);
+  --shadow-2: 0 10px 28px -14px rgb(0 0 0 / 0.72), 0 2px 6px -3px rgb(0 0 0 / 0.5);
+  --shadow-3: 0 28px 64px -24px rgb(0 0 0 / 0.86), 0 10px 22px -12px rgb(0 0 0 / 0.6);
 }
 
 :root {
+  /* ── 间距：4 / 8 / 12 / 16 / 24 / 32。只有这六档，不出现 13px、18px、26px ── */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  /* ── 圆角：卡片 12 / 岛 22 / 状态点 50%。大框包小框，同心 ── */
   --r-xs: 4px;
   --r-sm: 6px;
   --r-md: 8px;
   --r-lg: 12px;
   --r-xl: 16px;
+  --r-island: 22px;
 
+  /* ── 动效：统一一条曲线，快出慢收，像有惯性 ── */
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
   --dur-fast: 110ms;
   --dur-base: 170ms;
-  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
-  --ease-spring: cubic-bezier(0.2, 0.9, 0.3, 1.15);
+  --dur-slow: 260ms;
+
+  /* ── 导航宽度：被内容逼出来的两个数字 ──
+     72 = 能放图标且不喧宾夺主的最小宽度
+     240 = 能放下 6–8 个中文二级项且不换行的最小宽度
+     216 = 72 轨悬停展开后刚好露出文字的宽度 */
+  --rail-w: 72px;
+  --rail-open: 216px;
+  --panel-w: 240px;
+  --island-inset: 16px;
 }
 
 @theme inline {
@@ -155,11 +204,16 @@
   --color-err-soft: var(--err-soft);
   --color-info: var(--info);
   --color-info-soft: var(--info-soft);
+  --color-nav-bg: var(--nav-bg);
+  --color-nav-fg: var(--nav-fg);
+  --color-nav-fg-active: var(--nav-fg-active);
+  --color-nav-active-bg: var(--nav-active-bg);
   --radius-xs: var(--r-xs);
   --radius-sm: var(--r-sm);
   --radius-md: var(--r-md);
   --radius-lg: var(--r-lg);
   --radius-xl: var(--r-xl);
+  --radius-island: var(--r-island);
   --shadow-1: var(--shadow-1);
   --shadow-2: var(--shadow-2);
   --shadow-3: var(--shadow-3);
@@ -175,13 +229,61 @@
   body {
     text-autospace: normal;
     margin: 0;
-    background: var(--canvas);
+    /* 极淡的纵向渐变：让岛有"落"的地方，而不是浮在纯色上 */
+    background: linear-gradient(180deg, var(--canvas) 0%, var(--canvas-to) 100%);
+    background-attachment: fixed;
     color: var(--fg);
     font-family: var(--font-sans);
     font-size: 13px;
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
+  }
+
+  /* ---------------------------------------------------------------
+   * 岛：整个控制台是浮在背景上的一块板
+   *   外壳四周留 16px；岛 22px 圆角 + 1px 亮边 + 双层淡阴影。
+   *   岛内所有区域共享这个大圆角，靠 overflow:hidden 裁切 —— 不各自圆角，
+   *   否则大框包小框的同心感就没了。
+   * --------------------------------------------------------------- */
+  .ad-island {
+    position: relative;
+    margin: var(--island-inset);
+    min-height: calc(100dvh - var(--island-inset) * 2);
+    border-radius: var(--r-island);
+    border: 1px solid var(--island-edge);
+    background: var(--surface);
+    box-shadow: var(--island-shadow);
+    overflow: hidden;
+    display: flex;
+    min-width: 0;
+  }
+
+  /* 窄屏：留白收窄，圆角跟着收，否则岛会缩得只剩一条 */
+  @media (max-width: 767px) {
+    .ad-island {
+      margin: 8px;
+      min-height: calc(100dvh - 16px);
+      border-radius: var(--r-lg);
+    }
+  }
+
+  /* 磨砂玻璃：**只给浮起来的东西**（弹层、需要跳出来的卡片）。
+     普通内容卡片是平的（--surface 纯色 + 1px 边），玻璃是稀缺资源。 */
+  .ad-glass {
+    background: color-mix(in oklab, var(--surface) 78%, transparent);
+    backdrop-filter: blur(18px) saturate(150%);
+    -webkit-backdrop-filter: blur(18px) saturate(150%);
+    border: 1px solid var(--island-edge);
+  }
+
+  /* 状态点：8px 圆点 + 文字。色块太重，会把安静的信息变成警报。 */
+  .ad-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: none;
   }
 
   /* 焦点环：全局统一，绝不用 outline:none 抹掉 */
@@ -329,6 +431,23 @@
 }
 .nav-link:active { transform: scale(0.985); }
 .nav-link { transition: background-color 130ms var(--ease-out), color 130ms var(--ease-out), transform 130ms var(--ease-out); }
+
+/* ── 左轨（72px）的一级项：深色区里的按钮 ────────────────────────
+   只有"当前"亮起；未选中压暗。悬停给一点点亮度提升，但不加背景，
+   否则会和"选中"抢信号。 */
+.rail-item {
+  transition: background-color 140ms var(--ease-out), color 140ms var(--ease-out),
+              transform 140ms var(--ease-out);
+}
+.rail-item svg { transition: transform 200ms var(--ease-spring); }
+@media (hover: hover) {
+  .rail-item:hover { background: rgb(255 255 255 / 0.05); }
+  .rail-item:hover svg { transform: scale(1.1); }
+}
+.rail-item:active { transform: scale(0.97); }
+@media (prefers-reduced-motion: reduce) {
+  .rail-item, .rail-item svg { transition: none !important; transform: none !important; }
+}
 
 /* 卡片：可点的卡片才有抬升，纯展示卡片不动 */
 .card-lift { transition: transform 180ms var(--ease-out), box-shadow 180ms var(--ease-out), border-color 180ms; }

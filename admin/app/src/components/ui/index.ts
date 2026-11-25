@@ -10,3 +10,4 @@ export { TableWrap, Th, Td, Tr } from './table';
 export { Dialog, DialogTrigger, DialogClose, DialogContent } from './dialog';
 export { Switch } from './switch';
 export { ToastProvider, useToast } from './toast';
+export { MetricStrip, Verdict, StatusTag, Panel, type MetricItem } from './panel';
