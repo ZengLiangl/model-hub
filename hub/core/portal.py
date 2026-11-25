@@ -288,6 +288,7 @@ class PortalHandler(BaseHTTPRequestHandler):
         "/api/hub/accounts", "/api/hub/route-stats", "/api/hub/logs",
         "/api/hub/usage", "/api/hub/rewards", "/api/hub/scheduler",
         "/api/hub/timeseries", "/api/hub/account-health",
+        "/api/hub/cooldowns",
         "/css/", "/js/", "/fonts/", "/img/",
     )
 
@@ -356,9 +357,9 @@ class PortalHandler(BaseHTTPRequestHandler):
             except (ConnectionError, OSError):
                 self.close_connection = True
 
-    def _json(self, status, obj, head_only=False):
+    def _json(self, status, obj, head_only=False, extra_headers=None):
         self._send(status, json.dumps(obj, ensure_ascii=False), MIME_TYPES[".json"],
-                   head_only=head_only)
+                   head_only=head_only, extra_headers=extra_headers)
 
     def _read_body(self):
         """读请求体：支持 Content-Length 与 **chunked**。
@@ -684,6 +685,21 @@ class PortalHandler(BaseHTTPRequestHandler):
                 until=(q4.get("until", [None]) or [None])[0]), head_only=head_only)
         if rest == "keys":
             return self._json(200, self._hub_keys(), head_only=head_only)
+        if rest == "cooldowns":
+            # 模型冷却视图（引擎侧记录的上游限流窗口）。读是开放的（本机工具）：
+            # 面板据此画「哪个模型停到几点」，排障时也不必再去翻各引擎的账号档。
+            snap = self.server.route_snapshot
+            router.refresh_snapshot(ports, None, snap)
+            q5 = urllib.parse.parse_qs(query or "")
+            model = (q5.get("model", [None]) or [None])[0]
+            return self._json(200, {
+                "now": int(time.time()),
+                "model": model or None,
+                "cooldowns": router.cooldown_summary(snap, model),
+                "parked": sorted("%s:%s" % (e, r) for e, r in (snap.parked or set())),
+                "engines": {e: dict((snap.cooldowns or {}).get((e, "cn"), {}))
+                            for e in ENGINES},
+            }, head_only=head_only)
         if rest == "selfcheck":
             return self._json(200, self._selfcheck(), head_only=head_only)
         if rest == "try":
@@ -708,7 +724,7 @@ class PortalHandler(BaseHTTPRequestHandler):
         "/api/hub/timeseries", "/api/hub/account-health",
                           "/api/hub/route-stats", "/api/hub/route-log",
                           "/api/hub/keys", "/api/hub/by-model", "/api/hub/selfcheck", "/api/hub/try",
-                          "/api/hub/settings"],
+                          "/api/hub/cooldowns", "/api/hub/settings"],
         })
 
     def _handle_try(self):
@@ -1286,6 +1302,11 @@ class PortalHandler(BaseHTTPRequestHandler):
         # 但另一区仍留在链尾兜底（「显式优先，不把路走死」）。
         requested = (params.get("realm") or [None])[0] or self.headers.get("X-Realm")
         candidates = router.candidates_for(model, snapshot, cfg, requested)
+        # ★ 模型冷却降权（取自 workbuddy2api-hub 的 model_cooldowns 语义）：
+        #   引擎自己记着「这个模型撞线停到几点」，候选链按它把「必然 429」的跳
+        #   排到最后 —— 但**不摘掉**（全在冷却时仍试一次，上游比我们猜得准）。
+        #   必须在 orchestrator 之前做：用户规则拿到的是已经排好的链。
+        candidates = router.order_by_cooldown(candidates, snapshot, model)
         if scope_engines:
             candidates = [c for c in candidates if str(c[0]).lower() in scope_engines]
         _rule = None
@@ -1330,6 +1351,24 @@ class PortalHandler(BaseHTTPRequestHandler):
         #   ② X-Realm 头同理要剥（wb 的 _request_realm 里头优先于 query）。
         forwarded = urllib.parse.urlencode(
             [(k, v) for k, values in params.items() if k != "realm" for v in values])
+        # ★ 冷却期拦停（对齐 workbuddy2api-hub 的 Account.ready(model=...)）：
+        #   整条候选链**全部**都在这个模型的冷却里时，直接回 429 + Retry-After，
+        #   不白跑往返、也不把上游的 429 原样透出去（客户端看到的恢复时刻会是
+        #   我们自己算的，比上游正文更准）。到点之后下一次请求自然放行 ——
+        #   快照的冷却表里过期的条目在收集时就清掉了（collect_cooldowns）。
+        #   注意：只有**确知**全链冷却才拦（hold_until 的注释里有三种放过条件）。
+        hold = router.hold_until(candidates, snapshot, model)
+        if hold is not None:
+            body_out = router.cooldown_429_body(model, hold, candidates, snapshot)
+            sys.stderr.write("[portal] cooldown hold model=%s until=%s hops=%d\n"
+                             % (model, time.strftime("%H:%M:%S", time.localtime(hold)),
+                                len(candidates)))
+            sys.stderr.flush()
+            extra = [("Retry-After", str(body_out["error"]["retry_after"])),
+                     ("X-Hub-Model-Cooldown", model),
+                     ("X-Hub-Route", "cooldown:hold"),
+                     ("X-Hub-Route-Attempts", "[]")]
+            return self._json(429, body_out, extra_headers=extra)
         attempts = []
         last = None
         last_engine = None
@@ -1388,6 +1427,13 @@ class PortalHandler(BaseHTTPRequestHandler):
         self._record_route(last_engine, reported, attempts, last[0], model)
         extra = [("X-Hub-Route", "%s:%s" % (last_engine, reported)),
                  ("X-Hub-Route-Attempts", json.dumps(attempts, ensure_ascii=False))]
+        # ★ 这次请求里有几跳因为模型冷却被降权（没被摘掉，只是排到后面）。
+        #   排障时「为什么第一跳不是 wb」的答案就在这里 —— 面板不用去猜。
+        cooled = [(e, r) for (e, r) in candidates
+                  if router.model_cooldown_until(snapshot, e, r, model) is not None]
+        if cooled:
+            extra.append(("X-Hub-Model-Cooldown",
+                          ",".join("%s:%s" % (e, r) for e, r in cooled)))
         return self._relay(last[0], last[1], last[2], last_engine,
                            extra_headers=extra)
 

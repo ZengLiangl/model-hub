@@ -14,6 +14,15 @@
   * 合并模型清单（/v1/models）：同名模型合一条，带 engines 与 realm；
     **只有「有账号的 引擎 × 区域」才发布**（见 publishing_realms）。
 
+  * **模型冷却**（取自 workbuddy2api-hub 的 model_cooldowns 语义）：引擎自己早就把
+    「某个模型撞了 429 / 6004，停到某个时刻」记在账号档里
+    （wb_accounts.Account.model_cooldowns / model_caps，面板上就是
+    modelCooldowns[].expiresAt），但融合层以前完全不看 —— 于是候选链会把请求送进
+    一个**必然 429** 的跳，白等一次往返，还把上游的 429 原样透给客户端。
+    现在快照里带上 cooldowns[(engine, realm)][model] = 恢复时刻，候选链按它排序
+    （见 order_by_cooldown）。**只降权、不摘除**：同一引擎的另一个账号可能还能服务
+    这个模型，摘掉会把路走死。
+
 只用标准库。
 """
 import http.client
@@ -61,6 +70,13 @@ class RouteSnapshot(object):
         #: 面板上的区开关与号的实际归属经常对不上（实测 wb 开关 intl、号在 cn），
         #: 于是任何不带 realm 的请求都会撞上「该区域没有任何账号」。
         self.current_realm = {}
+        #: 模型冷却：{(engine, realm): {model: 恢复时刻 epoch}}。
+        #: 空 = **不知道**（引擎没答 /accounts），与「知道且没在冷却」不同 ——
+        #: 后者是 {(engine, realm): {}}。判据见 model_cooldown_until。
+        self.cooldowns = {}
+        #: 整个账号级冷却的 (engine, realm)：该区**所有**账号都在 cooldown_until
+        #: 之内（引擎的 inCooldown）。它比模型级更狠，但同样只降权不摘除。
+        self.parked = set()
         self.errors = {}
 
     def is_fresh(self):
@@ -138,6 +154,226 @@ def _int_or_none(value):
         return None
 
 
+def _epoch_or_none(value):
+    """冷却时刻：能转成正数 epoch 就给 float，否则 None（不编造）。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (number > 0):
+        return None
+    return number
+
+
+def collect_cooldowns(ports):
+    """从各引擎的 /accounts?realm=all 里收「模型冷却」与「账号级冷却」。
+
+    返回 (cooldowns, parked, errors)：
+      cooldowns = {(engine, realm): {model: epoch}}   —— 该区**所有**账号里，
+                  某模型最晚的恢复时刻（最保守：最晚恢复的那个账号决定这个跳能不能
+                  省掉往返；早恢复的账号不会让这个跳更早可用）。
+      parked    = {(engine, realm)}                  —— 该区**每一个**账号都在
+                  inCooldown 里（引擎自己的账号级冷却）。只要有一个账号可用，
+                  这一跳就还有希望，不进 parked。
+      errors    = {engine: str|None}
+
+    为什么走 /accounts 而不是读引擎的账号档：融合层不该知道各引擎的存储格式
+    （wb/qd/trae 三家的档结构不同，而且随时会变）；/accounts 是引擎自己对外
+    承诺的面板接口，modelCooldowns / inCooldown 是它的既有字段。
+    取不到 → 该引擎不进 cooldowns（= 不知道），路由按老行为放过。
+
+    只用标准库 + aggregator 的既有权杖（_request 会自己处理 /panel/login）。
+    """
+    from hub.core import aggregator        # 延迟导入：core 内部避免循环引用
+    cooldowns, parked, errors = {}, set(), {}
+    seen = {}
+    for engine in ENGINES:
+        port = (ports or {}).get(engine)
+        if not port:
+            continue
+        doc = aggregator._json_or_none(engine, ports, "/accounts?realm=all")
+        if not isinstance(doc, dict):
+            errors[engine] = "accounts unavailable"
+            continue
+        errors[engine] = None
+        # 三种形状都认：
+        #   · 引擎 /accounts 的**原始**回包 —— 键是 `accounts`（实测 wb/qd/trae 三家
+        #     都是这个键；曾按 `items` 读，于是冷却表永远是空的，白改一场）；
+        #   · aggregator.hub_accounts 归一后的形状 —— 键是 `items`；
+        #   · 直接给一个数组。
+        rows = doc.get("accounts")
+        if not isinstance(rows, list):
+            rows = doc.get("items")
+        if not isinstance(rows, list):
+            rows = []
+        #: 每个 (engine, realm) 的账号数与「在冷却中的账号数」，用来判 parked。
+        tally = seen.setdefault(engine, {})
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            realm = str(row.get("realm") or "").strip().lower()
+            if realm not in REALMS:
+                continue
+            bucket = tally.setdefault(realm, {"total": 0, "cooling": 0})
+            bucket["total"] += 1
+            if row.get("inCooldown") is True:
+                bucket["cooling"] += 1
+            models = row.get("modelCooldowns")
+            if not isinstance(models, list):
+                continue
+            target = cooldowns.setdefault((engine, realm), {})
+            for item in models:
+                if not isinstance(item, dict):
+                    continue
+                mid = str(item.get("model") or "").strip().lower()
+                until = _epoch_or_none(item.get("expiresAt"))
+                if not mid or until is None:
+                    continue
+                # 取**最晚**：同区多个账号都在冷却时，这一跳要等最晚的那个。
+                if until > target.get(mid, 0.0):
+                    target[mid] = until
+    now = time.time()
+    for engine, realms in seen.items():
+        for realm, bucket in realms.items():
+            # 只有「确实有账号、且每一个都在冷却」才算整区 parked。
+            # 账号数为 0 时不算：那是没配好，不该被当成冷却。
+            if bucket["total"] and bucket["cooling"] >= bucket["total"]:
+                parked.add((engine, realm))
+    # 过期条目在收集时清掉，快照里只留**还有效**的冷却。
+    for key in list(cooldowns):
+        live = {m: t for m, t in cooldowns[key].items() if t > now}
+        cooldowns[key] = live
+    return cooldowns, parked, errors
+
+
+def model_cooldown_until(snapshot, engine, realm, model):
+    """该 (engine, realm) 上这个模型的恢复时刻；不知道 / 没在冷却 → None。
+
+    None 与「已过期」在这里是同一个结果（都返回 None）—— 调用方只需要知道
+    「现在能不能试」，不需要区分「从没撞过」和「撞过但好了」。
+    """
+    model = str(model or "").strip().lower()
+    if not model:
+        return None
+    table = (getattr(snapshot, "cooldowns", None) or {}).get((engine, realm))
+    if not isinstance(table, dict):
+        return None
+    until = table.get(model)
+    if until is None:
+        return None
+    return until if until > time.time() else None
+
+
+def order_by_cooldown(candidates, snapshot, model):
+    """按「这一跳现在能不能服务这个模型」把候选链重排（**稳定**，不改长度）。
+
+    三档，档内保持原顺序（原顺序已经编码了区域优先与引擎就绪排序）：
+      0. 该模型在这个跳上没在冷却 —— 立刻能试；
+      1. 模型在冷却，但该跳还有别的账号（不是整区 parked）—— 也许能成；
+      2. 整区 parked（所有账号都在账号级冷却）—— 几乎必然失败，放最后。
+
+    为什么不直接摘掉：摘掉之后「全部候选都在冷却」就退化成空链，portal 会掉进
+    fallback_candidates 去打一个默认引擎 —— 那反而绕过了这里的信息，还可能
+    打到一个更差的跳。降权保留了「全都在冷却时仍然试一次」的语义（上游的
+    429 比我们自己猜的更准），同时把最好的那一跳排到最前。
+    """
+    if not candidates:
+        return list(candidates)
+    parked = getattr(snapshot, "parked", None) or set()
+    ranked = []
+    for index, (engine, realm) in enumerate(candidates):
+        if (engine, realm) in parked:
+            rank = 2
+        elif model_cooldown_until(snapshot, engine, realm, model) is not None:
+            rank = 1
+        else:
+            rank = 0
+        ranked.append((rank, index, (engine, realm)))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in ranked]
+
+
+def cooldown_summary(snapshot, model=None):
+    """把快照里的冷却收成可读形状（面板 / 排障头用）。
+
+    model 给了就只报这个模型的；没给就报全部仍在冷却的。
+    返回 [{engine, realm, model, until, seconds_left}]，按剩余时间升序。
+    """
+    now = time.time()
+    out = []
+    wanted = str(model or "").strip().lower()
+    for (engine, realm), table in (getattr(snapshot, "cooldowns", None) or {}).items():
+        for mid, until in (table or {}).items():
+            if wanted and mid != wanted:
+                continue
+            left = until - now
+            if left <= 0:
+                continue
+            out.append({"engine": engine, "realm": realm, "model": mid,
+                        "until": int(until), "seconds_left": int(left)})
+    out.sort(key=lambda item: item["seconds_left"])
+    return out
+
+
+def hold_until(candidates, snapshot, model):
+    """整条候选链**全部**都在这个模型的冷却里时，返回最早的恢复时刻；否则 None。
+
+    这是「冷却期内不调度，到点后再请求」的判据（对齐 workbuddy2api-hub 的
+    Account.ready(model=...) 语义：冷却中的账号不会被 pick）。
+
+    只在**确知**全链冷却时才拦：
+      · 候选为空 → None（交给 fallback_candidates 的老路）；
+      · 任意一跳没有这个模型的冷却记录 → None（那一跳还能试）；
+      · 引擎没答 /accounts（快照里没有该键）→ None（不知道就不拦）。
+    返回 None 时调用方照常逐跳尝试 —— 「上游的 429 比我们猜的更准」。
+    """
+    if not candidates:
+        return None
+    table = getattr(snapshot, "cooldowns", None) or {}
+    if not table:
+        return None
+    earliest = None
+    for engine, realm in candidates:
+        until = model_cooldown_until(snapshot, engine, realm, model)
+        if until is None:
+            return None                      # 这一跳还能试，别拦
+        earliest = until if earliest is None else min(earliest, until)
+    return earliest
+
+
+def cooldown_429_body(model, until, candidates, snapshot):
+    """全链冷却时回的 429 正文：说清「哪个模型、等多久、几点恢复、哪些跳在等」。
+
+    措辞对齐 OpenAI 的 429 形状（error.message/type/code），客户端现有的
+    Retry-After 处理不用改。
+    """
+    now = time.time()
+    left = max(0, int(until - now)) if until else 0
+    rows = []
+    for engine, realm in candidates:
+        stop = model_cooldown_until(snapshot, engine, realm, model)
+        rows.append({"engine": engine, "realm": realm,
+                     "until": int(stop) if stop else None,
+                     "seconds_left": max(0, int(stop - now)) if stop else None})
+    return {
+        "error": {
+            "message": ("model %r is in upstream cooldown on every candidate hop; "
+                        "retry after %d seconds (resumes at %s)"
+                        % (model, left,
+                           time.strftime("%Y-%m-%d %H:%M:%S",
+                                         time.localtime(until)) if until else "?")),
+            "type": "rate_limit_error",
+            "code": "model_cooldown",
+            "model": model,
+            "retry_after": left,
+            "resumes_at": int(until) if until else None,
+            "hops": rows,
+            "hint": ("这是引擎侧记录的上游限流窗口（429 / code 6004 的恢复时刻），"
+                     "不是网关自己编的。窗口到期后同一个请求会自动重新调度。"),
+        }
+    }
+
+
 def refresh_snapshot(ports, key, snapshot, force=False):
     """按 TTL 重建快照；并发调用只让一个线程真正探测。"""
     if not force and snapshot.is_fresh():
@@ -198,12 +434,22 @@ def refresh_snapshot(ports, key, snapshot, force=False):
         for engine, counts in _realm_counts_from_accounts(ports).items():
             if engine in missing and counts:
                 by_realm[engine] = counts
+    # ★ 模型冷却（第 N 轮）：引擎自己的 /accounts 已经记着「哪个模型撞线停到几点」，
+    #   这里收进快照，候选链据此降权。取不到就**空表**（= 不知道），路由行为不变。
+    cooldowns, parked, cd_errors = {}, set(), {}
+    try:
+        cooldowns, parked, cd_errors = collect_cooldowns(ports)
+    except Exception as exc:                       # noqa: BLE001 —— 冷却探测不许打断路由
+        for engine in ENGINES:
+            cd_errors[engine] = "cooldown probe failed: %s" % (exc,)
     with snapshot.lock:
         snapshot.models = models
         snapshot.ready = ready
         snapshot.accounts = accounts
         snapshot.accounts_by_realm = by_realm
         snapshot.current_realm = current
+        snapshot.cooldowns = cooldowns
+        snapshot.parked = parked
         snapshot.errors = errors
         snapshot.at = time.time()
     return snapshot
