@@ -9850,7 +9850,18 @@ class Handler(BaseHTTPRequestHandler):
         return (self.headers.get("X-Panel-Token") or "").strip()
 
     def _panel_ok(self):
-        return PANEL.valid(self._panel_token())
+        if PANEL.valid(self._panel_token()):
+            return True
+        # 门户统一登录：门户已校验面板口令，转发时带内部令牌；
+        # 只认回环来源，直接访问引擎端口仍然走本引擎自己的口令。
+        secret = os.environ.get("HUB_INTERNAL_TOKEN") or ""
+        got = (self.headers.get("X-Hub-Panel") or "").strip()
+        if secret and got and got == secret:
+            try:
+                return ipaddress.ip_address(self.client_address[0]).is_loopback
+            except Exception:
+                return False
+        return False
 
     def _client_is_loopback(self):
         """agents 写配置只信 loopback：改的是网关本机的文件。"""
@@ -11336,6 +11347,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(http_status, started)
             if not isinstance(started, dict) or not started.get("state"):
                 return self._error(502, "invalid OAuth login response", "oauth_start_failed")
+            # 兼容旧面板：老引擎回 {"state","authUrl","expiresIn"}，新引擎
+            # （trae_oauth）回 {"state","authorization_url","verification_uri"}。
+            # 两种拼写都给出，融合层面板与引擎自带面板都能直接用。
+            url = (started.get("authUrl") or started.get("authorization_url")
+                   or started.get("verification_uri"))
+            if url and not started.get("authUrl"):
+                started["authUrl"] = url
+            if "expiresIn" not in started and isinstance(started.get("expires_at"), (int, float)):
+                try:
+                    started["expiresIn"] = max(0, int(started["expires_at"] - time.time()))
+                except (TypeError, ValueError, OverflowError):
+                    pass
             return self._json(200, started)
         if path == "/accounts/login/cancel":
             state = payload.get("state") or ""
