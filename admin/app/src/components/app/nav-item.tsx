@@ -18,6 +18,8 @@ export function NavItem(props: {
   label: string;
   onNavigate?: () => void;
   compact?: boolean;
+  /** 所在底色：深色导航区（左轨/窄屏抽屉）用 nav，浅色右面板用 panel */
+  tone?: 'nav' | 'panel';
 }) {
   const Icon = props.route.icon;
   return (
@@ -30,13 +32,17 @@ export function NavItem(props: {
           'nav-link group relative flex cursor-pointer items-center rounded-[8px]',
           'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent',
           props.compact ? 'h-9 w-9 justify-center' : 'h-8 gap-2.5 px-2.5',
-          state.isActive
-            ? 'font-medium text-nav-fg-active'
-            : 'text-nav-fg hover:text-nav-fg-active',
+          // 深色底（左轨 / 窄屏抽屉）用 nav 令牌；右面板是浅底，用 panel 令牌
+          props.compact || props.tone === 'nav'
+            ? (state.isActive ? 'font-medium text-nav-fg-active' : 'text-nav-fg hover:text-nav-fg-active')
+            : (state.isActive ? 'font-medium text-panel-nav-fg-active' : 'text-panel-nav-fg hover:text-panel-nav-fg-active'),
         );
       }}
       style={function (state) {
-        return state.isActive ? { background: 'var(--nav-active-bg)' } : undefined;
+        if (!state.isActive) return undefined;
+        // 深色底上的选中块要用白色叠层，浅底上用墨色叠层
+        return { background: (props.compact || props.tone === 'nav')
+          ? 'var(--nav-active-bg)' : 'var(--panel-nav-active-bg)' };
       }}
     >
       {function (state) {

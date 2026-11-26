@@ -1,30 +1,25 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="color-scheme" content="light dark" />
-    <meta name="theme-color" content="#eef0ec" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#12141a" />
     <title>喵枢 · 三引擎合并网关</title>
     <script>
       // 首帧前定主题：避免"先白后黑"的闪烁（FOUC）。
-      // 三态：light / dark / system（默认 system，跟随系统）。
       (function () {
         try {
           var saved = localStorage.getItem("hub-theme");
-          var sysDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-          var mode = (saved === "light" || saved === "dark") ? saved : (sysDark ? "dark" : "light");
-          document.documentElement.setAttribute("data-theme", mode);
-          // 主题色也跟着走，否则移动端地址栏颜色会和页面打架
-          var meta = document.querySelector('meta[name="theme-color"]');
-          if (meta) meta.setAttribute("content", mode === "dark" ? "#1b1e1c" : "#eef0ec");
+          var sys = window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+          document.documentElement.setAttribute("data-theme", saved === "light" || saved === "dark" ? saved : sys);
         } catch (e) {}
       })();
     </script>
-    <script type="module" crossorigin src="./static/index-Cav9KIlP.js"></script>
+    <script type="module" crossorigin src="./static/index-BwHoEPKS.js"></script>
     <link rel="modulepreload" crossorigin href="./static/rolldown-runtime-XKyaHtl9.js">
     <link rel="modulepreload" crossorigin href="./static/react-vendor-DcLrkILy.js">
-    <link rel="stylesheet" crossorigin href="./static/index-BoTOam-1.css">
+    <link rel="stylesheet" crossorigin href="./static/index-36cYWtdG.css">
   </head>
   <body>
     <div id="root"></div>

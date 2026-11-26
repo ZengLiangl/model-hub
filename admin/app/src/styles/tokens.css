@@ -22,17 +22,17 @@
   --canvas: #eef0ec;
   --canvas-to: #f4f5f2;
   --surface: #ffffff;
-  --surface-2: #f6f7f5;
+  --surface-2: #f3f5f1;
   --overlay: #ffffff;
 
   --fg: #1a1d1b;
-  --fg-dim: #4b514d;
-  --fg-mute: #7c837e;
+  --fg-dim: #3d4340;
+  --fg-mute: #5d645e;
   --fg-invert: #ffffff;
 
-  --line-faint: #e8eae6;
-  --line: #dcdfd9;
-  --line-strong: #c4c8c1;
+  --line-faint: #e1e4de;
+  --line: #cfd3cc;
+  --line-strong: #b4bab2;
 
   /* 琥珀：浅底上要够重才读得清 */
   --accent: #b8862b;
@@ -65,6 +65,11 @@
   --nav-fg: rgb(232 234 236 / 0.55);
   --nav-fg-active: #ffffff;
   --nav-active-bg: rgb(255 255 255 / 0.09);
+
+  /* 二级菜单栏（右面板）是浅底，不能复用上面那套深底令牌 */
+  --panel-nav-fg: #4a514c;
+  --panel-nav-fg-active: #14171a;
+  --panel-nav-active-bg: rgb(20 23 26 / 0.06);
 
   /* 岛的亮边 + 双层淡阴影（大扩散 + 近距离贴地）。
      亮边是关键：没有它浅色岛在浅色背景上会糊成一片。 */
@@ -128,6 +133,11 @@
   --nav-fg-active: #ffffff;
   --nav-active-bg: rgb(255 255 255 / 0.08);
 
+  /* 右面板在深色下也是深底，直接复用导航色 */
+  --panel-nav-fg: rgb(232 234 236 / 0.55);
+  --panel-nav-fg-active: #ffffff;
+  --panel-nav-active-bg: rgb(255 255 255 / 0.08);
+
   --island-edge: rgb(255 255 255 / 0.07);
   --island-shadow: 0 28px 64px -30px rgb(0 0 0 / 0.72), 0 4px 12px -6px rgb(0 0 0 / 0.5);
 
@@ -161,11 +171,10 @@
   --dur-base: 170ms;
   --dur-slow: 260ms;
 
-  /* ── 导航宽度：被内容逼出来的两个数字 ──
-     72 = 能放图标且不喧宾夺主的最小宽度
-     240 = 能放下 6–8 个中文二级项且不换行的最小宽度
-     216 = 72 轨悬停展开后刚好露出文字的宽度 */
-  --rail-w: 72px;
+  /* ── 导航宽度：被内容逼出来的数字 ──
+     78 = 图标 + 一行文字（10.5px）并排放下且不换行
+     240 = 能放下 6–8 个中文二级项且不换行的最小宽度 */
+  --rail-w: 78px;
   --rail-open: 216px;
   --panel-w: 240px;
   --island-inset: 16px;
@@ -208,6 +217,9 @@
   --color-nav-fg: var(--nav-fg);
   --color-nav-fg-active: var(--nav-fg-active);
   --color-nav-active-bg: var(--nav-active-bg);
+  --color-panel-nav-fg: var(--panel-nav-fg);
+  --color-panel-nav-fg-active: var(--panel-nav-fg-active);
+  --color-panel-nav-active-bg: var(--panel-nav-active-bg);
   --radius-xs: var(--r-xs);
   --radius-sm: var(--r-sm);
   --radius-md: var(--r-md);
