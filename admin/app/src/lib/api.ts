@@ -218,7 +218,12 @@ export const engineLogs = (eng: Engine, limit = 200) =>
 
 export type UsagePayload = {
   requests?: number;
+  /** 真失败：上游报错、池子空、内容被拒等。不含中断与本地限流。 */
   errors?: number;
+  /** 客户端主动断开（Cursor 取消/切走），不是网关故障。 */
+  client_aborted?: number;
+  /** 网关自己判的 429（模型冷却/日限额），根本没打上游。 */
+  throttled?: number;
   prompt_tokens?: number;
   completion_tokens?: number;
   total_tokens?: number;
@@ -241,7 +246,7 @@ export type RecentRequestRow = {
   iso?: string;
   model?: string;
   kind?: string;
-  outcome?: string;          // completed / failed / client_aborted
+  outcome?: string;          // completed / failed / client_aborted / throttled / upstream_aborted
   elapsed_ms?: number;
   ttft_ms?: number;
   gen_ms?: number;

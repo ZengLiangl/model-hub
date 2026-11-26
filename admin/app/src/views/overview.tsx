@@ -96,7 +96,13 @@ export default function OverviewView() {
   const totals = useMemo(() => {
     const values = Object.values(usage.data?.values ?? {}) as Array<Record<string, number> | undefined>;
     const sum = (k: string) => values.reduce((a, r) => a + (Number(r?.[k]) || 0), 0);
-    return { requests: sum('requests'), errors: sum('errors'), tokens: sum('total_tokens'), credit: sum('credit'), cost: sum('cost_cny') };
+    return {
+      requests: sum('requests'),
+      errors: sum('errors'),
+      aborted: sum('client_aborted'),
+      throttled: sum('throttled'),
+      tokens: sum('total_tokens'), credit: sum('credit'), cost: sum('cost_cny'),
+    };
   }, [usage.data]);
 
   const engines = health.data?.engines ?? {};
@@ -154,7 +160,10 @@ export default function OverviewView() {
     const rows: { eng: Engine; row: RecentRequestRow }[] = [];
     for (const eng of ENGINES) {
       for (const row of (recent.data?.values?.[eng]?.rows ?? [])) {
-        if (String(row.outcome || '') === 'failed') rows.push({ eng: eng, row: row });
+        const o = String(row.outcome || '');
+        // throttled 是网关自己判的「现在别来」，不是一次失败；它单独计数，
+        // 否则一个 4 小时冷却窗口就能把「最近失败」刷成上百条一样的 429。
+        if (o === 'failed' || o === 'upstream_aborted') rows.push({ eng: eng, row: row });
       }
     }
     rows.sort(function (a, b) { return Number(b.row.at || 0) - Number(a.row.at || 0); });
@@ -165,6 +174,16 @@ export default function OverviewView() {
   const recentScanned = useMemo(function () {
     let n = 0;
     for (const eng of ENGINES) n += (recent.data?.values?.[eng]?.rows ?? []).length;
+    return n;
+  }, [recent.data]);
+
+  const throttledCount = useMemo(function () {
+    let n = 0;
+    for (const eng of ENGINES) {
+      for (const row of (recent.data?.values?.[eng]?.rows ?? [])) {
+        if (String(row.outcome || '') === 'throttled') n += 1;
+      }
+    }
     return n;
   }, [recent.data]);
 
@@ -186,8 +205,9 @@ export default function OverviewView() {
   }, [cooldowns.data]);  const usageAllFailed = (usage.data?.failed?.length ?? 0) === ENGINES.length;
   const allFailed = health.isError || usageAllFailed;
   const loading = usage.isPending || health.isPending;
-  // requests 是「成功」计数，errors 是「失败」计数；总尝试数 = 两者之和。
-  // 之前用 (requests - errors) / requests，失败多于成功时会算出 -188.9%。
+  // requests = 成功，errors = 真失败。中断（客户端自己断开）与 throttled
+  // （网关本地判的 429，没打上游）都不是网关的处理结果，不进成功率分母 ——
+  // 否则一个客户端反复重试就能把成功率压到 50%。
   const attempts = totals.requests + totals.errors;
   const empty = !loading && !allFailed && attempts === 0 && accountTotals.total === 0;
   const successRate = ratio(totals.requests, attempts);
@@ -255,7 +275,10 @@ export default function OverviewView() {
           value={fmtExact(attempts)}
           trend={series.counts}
           trendTone="accent"
-          hint={t('engine.online', { up: String(ENGINES.filter(function (e) { return engines[e] && engines[e].ok !== false; }).length), total: String(ENGINES.length) })}
+          hint={t('engine.online', { up: String(ENGINES.filter(function (e) { return engines[e] && engines[e].ok !== false; }).length), total: String(ENGINES.length) })
+            + (totals.aborted || totals.throttled
+              ? ' · ' + t('overview.kpi.excluded', { aborted: fmtExact(totals.aborted), throttled: fmtExact(totals.throttled) })
+              : '')}
         />
         <Kpi
           label={t('overview.kpi.errors')}
@@ -346,6 +369,12 @@ export default function OverviewView() {
             <ul className="flex flex-col gap-1.5 text-[11.5px]">
               <li className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full" style={{ background: 'var(--accent-2)' }} />{t('common.ok')} <span className="tnum text-fg-mute">{fmtExact(totals.requests)}</span></li>
               <li className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full" style={{ background: 'var(--err)' }} />{t('common.error')} <span className="tnum text-fg-mute">{fmtExact(totals.errors)}</span></li>
+              {totals.aborted ? (
+                <li className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full" style={{ background: 'var(--line-strong)' }} />{t('overview.legend.aborted')} <span className="tnum text-fg-mute">{fmtExact(totals.aborted)}</span></li>
+              ) : null}
+              {totals.throttled ? (
+                <li className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full" style={{ background: 'var(--warn)' }} />{t('overview.legend.throttled')} <span className="tnum text-fg-mute">{fmtExact(totals.throttled)}</span></li>
+              ) : null}
             </ul>
           </div>
         </Card>
@@ -359,7 +388,7 @@ export default function OverviewView() {
         <Card
           title={t('logs.tab.errors')}
           subtitle={t('overview.errors.subtitle', {
-            m: recentScanned, n: recentFailures.length, a: abortedCount,
+            m: recentScanned, n: recentFailures.length, a: abortedCount, th: throttledCount,
           })}
         >
           {recentFailures.length === 0 ? (

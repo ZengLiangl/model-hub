@@ -1449,7 +1449,10 @@ def key_label(key_id):
 
 
 def _empty_stats():
-    return {"requests": 0, "errors": 0, "prompt_tokens": 0, "completion_tokens": 0,
+    # client_aborted 单独一桶：客户端主动断开不是网关故障，混进 errors 会把
+    # 成功率与「失败」KPI 一起染红（实测 545/969，占 56%）。
+    return {"requests": 0, "errors": 0, "client_aborted": 0, "throttled": 0,
+            "prompt_tokens": 0, "completion_tokens": 0,
             "reasoning_tokens": 0, "cached_tokens": 0, "total_tokens": 0,
             "credit": 0.0, "cost_cny": 0.0, "cost_missing": {},
             "started": time.time(), "by_model": {},
@@ -1784,7 +1787,12 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         key_tag = f" key={key_label(key)}" if key else ""
         speed_tag = f" {row.get('tokens_per_sec', 0)}t/s" if row.get("tokens_per_sec") else ""
         miss_tag = " usage=missing" if usage_missing else ""
-        if kind == "chat":
+        if kind == "chat" and outcome == "client_aborted":
+            # 客户端主动断开不是成功：以前与 "chat done" 同一行、同一级别，
+            # 翻日志根本分不出来（实测 545 条中断看起来全像成功）。
+            log(f"chat aborted by client: model={model}{acc_tag}{egress_tag}{key_tag}{dur} "
+                f"tokens={t_tokens}{miss_tag} outcome=client_aborted", level="WARN", tag="chat")
+        elif kind == "chat":
             log(f"chat done: model={model}{acc_tag}{egress_tag}{key_tag}{dur} tokens={t_tokens} (in={fields.get('prompt_tokens',0)} out={fields.get('completion_tokens',0)}){speed_tag}{miss_tag}", tag="chat")
         else:
             # 媒体请求没有 token 概念，日志行只说"谁的哪个模型、花了多少、用多久"，
@@ -1920,8 +1928,10 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     acc_tag = f" acct={account[:8]}" if account else ""
     egress_tag = (f" slot={proxy_slot} egress={proxy_exit}"
                   if proxy_slot or proxy_exit else "")
+    # throttled 是网关自己判的「现在别来」（冷却/日限额），不是故障：记 ERROR
+    # 会让日志页一片红，真正要看的上游错误反而被淹没。
     log(f"request error: model={model}{dur}{acc_tag}{egress_tag} status={status} outcome={outcome} msg={str(message)[:180]}",
-        level="ERROR", tag="chat")
+        level="WARN" if outcome == "throttled" else "ERROR", tag="chat")
     return row
 def _pct(values, q):
     """Nearest-rank percentile (no interpolation) - good enough for latency."""
@@ -5224,7 +5234,16 @@ def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None, also=None,
     targets = (snap,) if not also else (snap,) + tuple(also)
     if outcome != "completed":
         for tgt in targets:
-            tgt["errors"] += 1
+            # A client that walked away is not a gateway failure, and neither
+            # is a 429 the gateway synthesised without calling upstream: both
+            # get their own counter instead of dragging the failure rate and
+            # the success rate down with them.
+            if outcome == "client_aborted":
+                tgt["client_aborted"] += 1
+            elif outcome == "throttled":
+                tgt["throttled"] = tgt.get("throttled", 0) + 1
+            else:
+                tgt["errors"] += 1
             # Credit is money already spent: a request that failed after the
             # upstream had billed for it still consumed credit, so it is summed
             # here exactly like the analytics page sums it. Token totals keep
@@ -5966,6 +5985,7 @@ def _usage_timeseries_scan(realm, lo, hi, step):
                 key = int((at - origin) // step)
                 bucket = buckets.setdefault(key, {
                     "at": origin + key * step, "requests": 0, "errors": 0,
+                    "client_aborted": 0, "throttled": 0,
                     "prompt_tokens": 0, "completion_tokens": 0,
                     "reasoning_tokens": 0, "cached_tokens": 0,
                     "total_tokens": 0, "credit": 0.0,
@@ -5977,6 +5997,10 @@ def _usage_timeseries_scan(realm, lo, hi, step):
                                   "reasoning_tokens", "cached_tokens",
                                   "total_tokens"):
                         bucket[field] += (row.get(field) or 0)
+                elif outcome == "client_aborted":
+                    bucket["client_aborted"] += 1
+                elif outcome == "throttled":
+                    bucket["throttled"] = bucket.get("throttled", 0) + 1
                 else:
                     bucket["errors"] += 1
                 credit = row.get("credit") or 0
@@ -6944,7 +6968,7 @@ def _recent_scan_filtered(realm, need, filters, scan_cap=None):
 def recent_filter_match(item, account=None, model=None, key=None, outcome=None):
     """一条 usage 行是否命中「最近请求」的过滤条件。
 
-    outcome 里的 failed 是一个桶：failed / upstream_aborted / client_aborted 都算
+    outcome 里的 failed 是一个桶：failed / upstream_aborted / throttled / client_aborted 都算
     「这次没成功」。面板上的「失败」下拉就是这个口径——按字面值筛的话，上游中断和
     客户端取消会被漏掉，而它们恰恰是排查时最想看的两种。
     """
@@ -9740,6 +9764,10 @@ def _feed_series_bucket(bucket, row):
         for field in ("prompt_tokens", "completion_tokens", "reasoning_tokens",
                       "cached_tokens", "total_tokens"):
             bucket[field] += (row.get(field) or 0)
+    elif outcome == "client_aborted":
+        bucket["client_aborted"] += 1
+    elif outcome == "throttled":
+        bucket["throttled"] = bucket.get("throttled", 0) + 1
     else:
         bucket["errors"] += 1
     if outcome != "client_aborted":
@@ -9897,7 +9925,10 @@ def _usage_series_state_ready(r):
 def _series_output_bucket(bucket):
     """存量桶 -> 输出桶（键序固定；日桶的 hours 子表不进输出）。"""
     return {"at": bucket["at"], "requests": bucket["requests"],
-            "errors": bucket["errors"], "prompt_tokens": bucket["prompt_tokens"],
+            "errors": bucket["errors"],
+            "client_aborted": bucket.get("client_aborted", 0),
+            "throttled": bucket.get("throttled", 0),
+            "prompt_tokens": bucket["prompt_tokens"],
             "completion_tokens": bucket["completion_tokens"],
             "reasoning_tokens": bucket["reasoning_tokens"],
             "cached_tokens": bucket["cached_tokens"],
@@ -16717,10 +16748,15 @@ class RateLimited(Exception):
     pool: the credential is fine, only the model is cooling down for a while."""
 
     def __init__(self, http_error=None, detail="", wait=60, message="",
-                 reset_at=None):
+                 reset_at=None, local=False):
         self.http_error = http_error
         self.detail = detail or ""
         self.wait = max(1, int(wait or 60))
+        # True = 这次 429 是网关自己合成的（冷却窗口/日限额/并发满），**没有
+        # 调用上游**。这类拒绝在冷却期内会被同一个客户端反复撞上（实测一个
+        # 4 小时窗口撞出 249 条 failed），记账时归到 throttled 而不是 failed，
+        # 免得账本与「失败」KPI 被客户端重试放大。
+        self.local = bool(local)
         # 绝对重置时刻（epoch 秒）。wait 是「现在起还要等多久」，reset_at 是
         # 「什么时候恢复」——同一个窗口的两种说法，但只有后者在客户端排队、
         # 重试、或者把任务转给别的进程之后仍然成立。上游只在 6004 里给这个
@@ -18780,7 +18816,8 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         reason = ("every usable account in realm '%s' is cooling the upstream %s "
                   "window; the pool resumes in %ds" % (realm, model, wait))
         raise RateLimited(None, "usage exceeds frequency limit", wait=wait,
-                          message=reason, reset_at=time.time() + wait)
+                          message=reason, reset_at=time.time() + wait,
+                          local=True)
     texts, _ = _ensure_pools()
     text_accounts = texts.accounts() if texts else (POOL.accounts if POOL else [])
     enabled = [a for a in text_accounts
@@ -18793,7 +18830,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                   % wb_settings.daily_token_limit(ACCOUNTS_DIR, realm))
         midnight = seconds_until_local_midnight()
         raise RateLimited(None, reason, wait=midnight, message=reason,
-                          reset_at=time.time() + midnight)
+                          reset_at=time.time() + midnight, local=True)
     if (candidates and model
             and all(a.credit_limit_blocked(model) for a in candidates)):
         reason = ("every usable account reached today's credit limit (%s per "
@@ -18802,7 +18839,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                   % wb_settings.daily_credit_limit(ACCOUNTS_DIR, realm))
         midnight = seconds_until_local_midnight()
         raise RateLimited(None, reason, wait=midnight, message=reason,
-                          reset_at=time.time() + midnight)
+                          reset_at=time.time() + midnight, local=True)
     if (candidates and model
             and all(a.model_token_limit_blocked(model) for a in candidates)):
         reason = ("every usable account reached today's token limit for %s "
@@ -18810,7 +18847,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                   % (model, wb_settings.model_daily_token_limit(ACCOUNTS_DIR, realm)))
         midnight = seconds_until_local_midnight()
         raise RateLimited(None, reason, wait=midnight, message=reason,
-                          reset_at=time.time() + midnight)
+                          reset_at=time.time() + midnight, local=True)
     if busy and last_error is None:
         # 名额全满：账号本身完全健康，只是每个都在跑别的请求。必须报得比
         # 「全部停用/冷却/过期」清楚——否则排查的人会去看账号状态，而真正
@@ -18820,7 +18857,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                   "request(s) (account_max_concurrent=%d); retry shortly or "
                   "raise the cap" % (limit, limit))
         raise RateLimited(None, reason, wait=1, message=reason,
-                          reset_at=time.time() + 1)
+                          reset_at=time.time() + 1, local=True)
     if (model and candidates
             and all(a.blocked_by_model_cooldown(model) for a in candidates)):
         # 全部候选都只差"这个模型的上游窗口恢复"：这是**等待**，不是故障。
@@ -27535,9 +27572,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(502, str(exc), "invalid_request_error")
         except RateLimited as exc:
             t = time.time() - t_start
-            record_error(model, 429, exc.detail[:200], elapsed_ms=int(t * 1000),
+            record_error(model, 429, (exc.detail or exc.message or "rate limited")[:200],
+                         elapsed_ms=int(t * 1000),
                          account=getattr(exc, "account_uid", None),
-                         key=self._key_id())
+                         key=self._key_id(),
+                         outcome="throttled" if exc.local else "failed")
             return self._rate_limited(exc)
         except urllib.error.HTTPError as exc:
             detail = read_http_error(exc, 600).decode("utf-8", "replace")
@@ -27900,10 +27939,11 @@ class Handler(BaseHTTPRequestHandler):
                          key=self._key_id())
             return self._anthropic_error(502, str(exc), "api_error")
         except RateLimited as exc:
-            record_error(model, 429, exc.detail[:200],
+            record_error(model, 429, (exc.detail or exc.message or "rate limited")[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
-                         key=self._key_id())
+                         key=self._key_id(),
+                         outcome="throttled" if exc.local else "failed")
             return self._anthropic_rate_limited(exc)
         except urllib.error.HTTPError as exc:
             try:
@@ -28489,10 +28529,13 @@ class Handler(BaseHTTPRequestHandler):
                          key=self._key_id())
             return self._error(502, str(exc), "invalid_request_error")
         except RateLimited as exc:
-            record_error(model, 429, exc.detail[:200],
+            # 网关自己判的冷却/限额（没打上游）记 throttled：它不是一次失败，
+            # 而是「现在别来」；记成 failed 会让账本被客户端重试线性放大。
+            record_error(model, 429, (exc.detail or exc.message or "rate limited")[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
-                         key=self._key_id())
+                         key=self._key_id(),
+                         outcome="throttled" if exc.local else "failed")
             return self._rate_limited(exc)
         except urllib.error.HTTPError as exc:
             detail = read_http_error(exc, 600).decode("utf-8", "replace")

@@ -96,10 +96,36 @@ describe('OverviewView 三态', () => {
     renderView();
     await waitFor(() => expect(screen.getByText(/deepseek-v4\.1-flash · 2494ms/)).toBeInTheDocument());
     const sub = document.body.textContent || '';
-    expect(sub).toMatch(/(最近 3 条请求里 2 条失败|2 failed out of the last 3 requests)/);
-    expect(sub).toMatch(/(客户端中断 1 条另计|1 client aborts excluded)/);
+    expect(sub).toMatch(/(最近 3 条请求里 2 条真失败|2 real failures in the last 3 requests)/);
+    expect(sub).toMatch(/(中断 1 条|1 aborts)/);
     // 运行日志里那条 ERROR 不该再被当成「失败记录」的来源
     expect(sub).not.toMatch(/(错误流水只在失败时才有内容|This tab only fills up on failures)/);
+  });
+
+
+  // 回归守卫：客户端反复重试冷却期内的 429 时，账本会堆出成百条 throttled。
+  // 它们不是网关失败 —— 一旦被算进「失败」KPI 或成功率分母，面板就会
+  // 谎报一次大规模故障（实测 4 小时冷却攒了 249 条，成功率被压到 50%）。
+  it('本地限流（throttled）不进失败列表，也不进成功率分母', async () => {
+    mockFetch((url) => {
+      if (url.includes('/health')) return json({ ok: true, engines: {} });
+      if (url.includes('/wb/usage/recent')) return json({ total: 3, rows: [
+        { at: 1794926789, iso: '2026-11-26T10:00:03', model: 'm', outcome: 'throttled', status: 429 },
+        { at: 1794926780, iso: '2026-11-26T10:00:02', model: 'm', outcome: 'throttled', status: 429 },
+        { at: 1794926770, iso: '2026-11-26T10:00:01', model: 'm', outcome: 'failed', status: 500 },
+      ] });
+      if (url.includes('/usage/recent')) return json({ total: 0, rows: [] });
+      if (url.includes('/logs')) return json({ logs: [] });
+      // 成功 3、真失败 1、限流 2 → 成功率必须是 75%，不是 3/(3+3)=50%
+      if (url.includes('/usage')) return json({ requests: 3, errors: 1, throttled: 2, client_aborted: 0, total_tokens: 1 });
+      return json({});
+    });
+    renderView();
+    await waitFor(() => expect(document.body.textContent || '').toMatch(/75\.0%/));
+    const sub = document.body.textContent || '';
+    // 限流单独列出，不混进「真失败」
+    expect(sub).toMatch(/(限流 2|2 throttled)/);
+    expect(sub).toMatch(/(最近 3 条请求里 1 条真失败|1 real failures in the last 3 requests)/);
   });
 
   it('只有客户端中断时不算失败：空态说明窗口并给出入口', async () => {
@@ -115,9 +141,9 @@ describe('OverviewView 三态', () => {
       return json({});
     });
     renderView();
-    await waitFor(() => expect(document.body.textContent || '').toMatch(/(最近 2 条请求里没有失败|No failures in the last 2 requests)/));
+    await waitFor(() => expect(document.body.textContent || '').toMatch(/(最近 2 条请求里没有真失败|No real failures in the last 2 requests)/));
     const sub = document.body.textContent || '';
-    expect(sub).toMatch(/(客户端中断 2 条另计|2 client aborts excluded)/);
+    expect(sub).toMatch(/(中断 2 条|2 aborts)/);
     expect(screen.getByRole('button', { name: /请求流水|Requests/i })).toBeInTheDocument();
   });
 });

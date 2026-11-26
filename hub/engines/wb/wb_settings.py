@@ -2345,7 +2345,13 @@ def log_db_enabled(accounts_dir):
     created. Turning it on starts a durable copy so a crash, a restart or a
     slow-moving incident can still be read back afterwards.
     """
-    return load(accounts_dir).get(LOG_DB_ENABLED_KEY) is True
+    # 默认开：只留内存环的话，进程一重启历史日志全丢 —— 事后复盘时最想要的
+    # 恰恰是「刚才那波失败」。落库有 days/rows/bytes 三条保留上限兜底（默认
+    # 7 天），不会无限增长；显式存过 False 的仍然尊重。
+    value = load(accounts_dir).get(LOG_DB_ENABLED_KEY)
+    if value is None:
+        return True
+    return value is True
 
 
 def set_log_db_enabled(accounts_dir, enabled):
