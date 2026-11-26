@@ -138,6 +138,21 @@ describe('AppShell', () => {
     expect(titles.filter(function (x) { return /Daily|Operations|Config|日常|运维|配置/i.test(x); }).length).toBe(3);
   });
 
+  // 回归守卫：岛的「高度」必须是固定一屏，不能是 min-height。
+  // 用 min-height 时，日志页几百行内容会把岛撑高、整页跟着滚，左轨被拉出视口
+  // —— 左下角的主题/语言切换就在运维页消失（2026-11-26 实测，两页左下角不一致）。
+  it('岛高度固定为一屏，左轨左下角不随内容跑掉', async () => {
+    // vitest 下 import.meta.url 不是 file:// URL，用 cwd 拼（测试从 admin/app 跑）
+    const { readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const css = readFileSync(join(process.cwd(), 'src/styles/tokens.css'), 'utf8');
+    const island = css.match(/\.ad-island\s*\{([\s\S]*?)\}/);
+    expect(island).toBeTruthy();
+    const body = island![1];
+    expect(body).toMatch(/height:\s*calc\(100dvh/);
+    expect(body).not.toMatch(/(?<!-)min-height:\s*calc\(100dvh/);
+  });
+
   // ── 顶栏已删除（规范第七条）：标签页取代面包屑 ────────────────────
   it('不再有重复的顶栏面包屑：桌面下没有 header', async () => {
     sessionStorage.setItem('hub-panel-token', 'tk');

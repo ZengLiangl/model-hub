@@ -218,7 +218,9 @@ export function AppShell() {
       </div>
 
       {/* ══ 主区域 ═══════════════════════════════════════════════ */}
-      <div className="flex min-w-0 flex-1 flex-col">
+      {/* min-h-0：岛高度固定后，这一列必须在 flex 里能被压缩，否则内容再长也
+          会把 main 顶开、整页跟着滚（左轨就被拉出视口）。 */}
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {/* 窄屏顶栏（桌面下不需要：标题已在标签上、面板高亮上） */}
         <header className="flex h-12 shrink-0 items-center gap-2 border-b border-line-faint px-3 lg:hidden">
           <button

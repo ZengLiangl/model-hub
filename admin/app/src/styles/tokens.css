@@ -261,7 +261,11 @@
   .ad-island {
     position: relative;
     margin: var(--island-inset);
-    min-height: calc(100dvh - var(--island-inset) * 2);
+    /* 高度**固定**为一屏，不是 min-height：内容一长（比如请求流水的几百行日志），
+       min-height 会让岛被撑高、整页跟着滚，左轨被拉长到视口之外 —— 左下角的
+       主题/语言切换与圆角就那么被截断了，和内容短的页面看起来不一样。
+       钉死高度后由内部 main 自己滚动，左轨永远是"一屏高"，两处一致。 */
+    height: calc(100dvh - var(--island-inset) * 2);
     border-radius: var(--r-island);
     border: 1px solid var(--island-edge);
     background: var(--surface);
@@ -275,7 +279,7 @@
   @media (max-width: 767px) {
     .ad-island {
       margin: 8px;
-      min-height: calc(100dvh - 16px);
+      height: calc(100dvh - 16px);
       border-radius: var(--r-lg);
     }
   }
